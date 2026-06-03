@@ -215,7 +215,196 @@ fn runOne(res: *Resources, io: std.Io, gpa: std.mem.Allocator, item: queue_mod.P
             }
             return runPiper(res, io, sa, item);
         },
+        .cloned => return runCloned(res, io, sa, item),
     }
+}
+
+// v1.4 — cloned voice path. Spawns scripts/voice_synth.py with the voice slug
+// (item.voice) and the text on stdin. Sidecar writes raw s16le mono 22050Hz
+// PCM to stdout, which we drain into a buffer and feed AudioPlayer. If the
+// sidecar fails (Python missing, model missing, embedding missing), the
+// worker logs and falls back to piper Faber (when available) or say.
+//
+// The sidecar lives outside the binary on purpose — v1.4 explicitly relaxes
+// the "only Zig" constraint for cloning (see docs/motor.md). Faber + say
+// remain Python-free.
+fn runCloned(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.PoppedItem) !void {
+    // Resolve voice dir + embedding before spawning Python — early exit
+    // saves the ~1.5s Python startup tax on misconfigured slugs.
+    const home_env = blk: {
+        const c = @cImport({
+            @cInclude("stdlib.h");
+        });
+        const ptr = c.getenv("HOME") orelse break :blk "/tmp";
+        break :blk std.mem.span(ptr);
+    };
+    const voice_dir = try std.fmt.allocPrint(sa, "{s}/.cache/agent-tts/voices/{s}", .{ home_env, item.voice });
+    const embedding_path = try std.fmt.allocPrint(sa, "{s}/embedding.npz", .{voice_dir});
+
+    var probe = std.Io.Dir.cwd().openFile(io, embedding_path, .{}) catch {
+        std.debug.print(
+            "[worker] id={d} cloned voice '{s}' has no embedding at {s} — falling back\n",
+            .{ item.id, item.voice, embedding_path },
+        );
+        return fallbackCloned(res, io, sa, item);
+    };
+    probe.close(io);
+
+    res.queue.setPlaying(io, item.id, @intCast(std.c.getpid()));
+
+    const t_synth0 = std.Io.Clock.now(.awake, io);
+    const samples = synthClonedViaSidecar(sa, io, embedding_path, item.text) catch |e| {
+        std.debug.print("[worker] id={d} cloned sidecar failed: {s} — falling back\n", .{ item.id, @errorName(e) });
+        return fallbackCloned(res, io, sa, item);
+    };
+    const t_synth1 = std.Io.Clock.now(.awake, io);
+
+    // XTTS-v2 emits at 24000 Hz by default; the sidecar resamples to 22050
+    // so we share Faber's pipeline. Document in motor.md.
+    const sample_rate: u32 = 22050;
+    const t_play0 = std.Io.Clock.now(.awake, io);
+    if (res.audio_player.ready) {
+        res.audio_player.streamS16le(samples, sample_rate) catch |e| {
+            std.debug.print("[worker] zaudio play failed: {s} — falling back to afplay\n", .{@errorName(e)});
+            try playViaAfplay(io, sa, samples, sample_rate);
+        };
+    } else {
+        try playViaAfplay(io, sa, samples, sample_rate);
+    }
+    const t_play1 = std.Io.Clock.now(.awake, io);
+
+    const synth_ms = @as(f64, @floatFromInt(t_synth1.nanoseconds - t_synth0.nanoseconds)) / 1_000_000.0;
+    const play_ms = @as(f64, @floatFromInt(t_play1.nanoseconds - t_play0.nanoseconds)) / 1_000_000.0;
+    std.debug.print("[worker] cloned id={d} slug={s} synth={d:.1}ms play={d:.1}ms samples={d}\n", .{
+        item.id, item.voice, synth_ms, play_ms, samples.len,
+    });
+
+    res.queue.finishPlaying(io, item.id);
+}
+
+fn fallbackCloned(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.PoppedItem) !void {
+    // Prefer piper Faber when loaded — same neural quality slot. Otherwise say.
+    // PoppedItem.voice is `[]u8` (mutable), so dupe the literal to satisfy the
+    // type — the fallback slot is short-lived and lives in the spawn arena.
+    if (build_options.enabled and res.piper != null) {
+        const fallback_voice = try sa.dupe(u8, "faber");
+        const fallback_item: queue_mod.PoppedItem = .{
+            .id = item.id,
+            .engine = .piper,
+            .voice = fallback_voice,
+            .rate = item.rate,
+            .text = item.text,
+        };
+        return runPiper(res, io, sa, fallback_item);
+    }
+    const fallback_voice = try sa.dupe(u8, DEFAULT_VOICE);
+    const fallback_item: queue_mod.PoppedItem = .{
+        .id = item.id,
+        .engine = .say,
+        .voice = fallback_voice,
+        .rate = item.rate,
+        .text = item.text,
+    };
+    return runSay(res, io, sa, fallback_item);
+}
+
+// Spawn scripts/voice_synth.py, write text on stdin, drain s16le PCM from
+// stdout. Sidecar is expected on cwd-relative path for v1.4 (ship-from-source).
+fn synthClonedViaSidecar(
+    sa: std.mem.Allocator,
+    io: std.Io,
+    embedding_path: []const u8,
+    text: []const u8,
+) ![]i16 {
+    const has_uv = lookPathSimple("uv");
+    const argv: [][]const u8 = if (has_uv) blk: {
+        const a = try sa.alloc([]const u8, 8);
+        a[0] = "uv";
+        a[1] = "run";
+        a[2] = "--with";
+        a[3] = "TTS";
+        a[4] = "scripts/voice_synth.py";
+        a[5] = "--embedding";
+        a[6] = embedding_path;
+        a[7] = "--rate";
+        // uv path stops here; remaining handled below
+        var b = try sa.alloc([]const u8, 9);
+        @memcpy(b[0..8], a);
+        b[8] = "22050";
+        break :blk b;
+    } else blk: {
+        const a = try sa.alloc([]const u8, 6);
+        a[0] = "python3";
+        a[1] = "scripts/voice_synth.py";
+        a[2] = "--embedding";
+        a[3] = embedding_path;
+        a[4] = "--rate";
+        a[5] = "22050";
+        break :blk a;
+    };
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+
+    // Write text + close stdin so the sidecar can return.
+    if (child.stdin) |*stdin| {
+        try stdin.writeStreamingAll(io, text);
+        stdin.close(io);
+        child.stdin = null;
+    }
+
+    // Drain stdout into an ArrayList(u8) of bytes, then reinterpret as i16.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(sa);
+    var chunk: [16 * 1024]u8 = undefined;
+    if (child.stdout) |*stdout| {
+        var sr = stdout.readerStreaming(io, &chunk);
+        // readSliceShort returns 0 on EOF (no error). Spin until short read
+        // delivers nothing.
+        while (true) {
+            const n = try sr.interface.readSliceShort(chunk[0..]);
+            if (n == 0) break;
+            try buf.appendSlice(sa, chunk[0..n]);
+        }
+    }
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.SidecarExit,
+        else => return error.SidecarAbnormal,
+    }
+
+    // Reinterpret buffer as s16le. Drop a trailing odd byte if the sidecar
+    // ever emits one (defensive — XTTS-v2 emits aligned frames).
+    const byte_len = buf.items.len & ~@as(usize, 1);
+    const samples = try sa.alloc(i16, byte_len / 2);
+    @memcpy(std.mem.sliceAsBytes(samples), buf.items[0..byte_len]);
+    return samples;
+}
+
+fn lookPathSimple(name: []const u8) bool {
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const env_ptr = c.getenv("PATH");
+    if (env_ptr == null) return false;
+    const path_env = std.mem.span(env_ptr);
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    var buf: [4096]u8 = undefined;
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const fd = std.c.open(full.ptr, .{ .ACCMODE = .RDONLY });
+        if (fd >= 0) {
+            _ = std.c.close(fd);
+            return true;
+        }
+    }
+    return false;
 }
 
 fn runSay(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.PoppedItem) !void {

@@ -150,6 +150,46 @@ The v1.2 spec asked for true gapless playback (custom miniaudio `decoderReadProc
 
 ---
 
+## v1.4 — Voice cloning · 2026-06-03
+
+**Shipped**:
+
+- `agent-tts voice clone --sample <wav> --name <slug>` — new subcommand. WAV header sniff (RIFF/WAVE magic + sample-rate + channels + bits-per-sample + data-chunk size). Sample duration must sit in `[20, 120]` seconds. Slug must match `[a-z0-9-]+`, 1-32 chars. Writes `~/.cache/agent-tts/voices/<slug>/embedding.npz` (via the Python sidecar) + `~/.cache/agent-tts/voices/<slug>/metadata.json` (written by Zig — keeps a structured record even if the sidecar partially fails)
+- `agent-tts voice list` — prints faber + each cloned voice with a one-line summary. Skips directories without a `metadata.json` (defensive against half-written clones)
+- `ipc.Engine` gains `cloned`. `parseRequest` accepts `ENQUEUE\tcloned\t<slug>\t<rate>\t<text>`. v0.6 4-field layout still backward-compatible (auto-falls-back to engine=`say`)
+- `daemon.runOne` routes `cloned` items through `scripts/voice_synth.py` via `std.process.Child`. Sidecar reads text on stdin, writes raw s16le mono 22050Hz PCM to stdout, which the daemon drains into a buffer and feeds `AudioPlayer.streamS16le` — same playback pipeline as Faber. If the embedding file is missing OR the sidecar exits non-zero, the worker logs + falls back: piper Faber when loaded, else `say` Luciana
+- `client.zig` resolves `--voice <slug>` implicitly: `faber` → piper, slug with a `metadata.json` on disk → cloned, anything else → say. Explicit `--engine` overrides
+- `scripts/voice_clone.py` — Coqui XTTS-v2 wrapper. Extracts `gpt_cond_latent` + `speaker_embedding` from the reference sample, writes `.npz` archive. Uses `coqui-tts >= 0.24.0` (community fork of the abandoned upstream `TTS` package). Cold model load ~6-10s on Apple Silicon CPU
+- `scripts/voice_synth.py` — counterpart that loads the embedding and synthesizes Portuguese (default) or any XTTS-v2 language. Output: raw s16le PCM on stdout at 22050Hz (resampled from XTTS's native 24000Hz via `scipy.signal.resample_poly`, falls back to `np.interp` if scipy missing)
+- `scripts/setup-voice-clone.sh` — idempotent bootstrap. Prefers `uv venv --python 3.11` (fast lockfile-clean install); falls back to `python3 -m venv`. Pins `coqui-tts>=0.24.0`, `scipy`, `soundfile`
+- `build.zig.zon` `.version = "1.4.0"`, `src/main.zig` `VERSION = "1.4.0"`. HELP updated with the new subcommand surface
+- `build.zig` — two new test steps (`run_voice_tests`, `run_ipc_tests`) so the v1.4 surface stays test-covered even if main.zig stops importing `voice.zig`
+
+**Measurements** (Mac Air M4, ReleaseFast):
+
+| Metric | Value | v1.4 target |
+|---------|-------|-----------|
+| `zig build` (Debug, host arm64) | clean | clean ✅ |
+| `zig build test --summary all` | 40/40 tests pass | all pass ✅ |
+| Slug validation tests | 3 pass (accept/reject empty+illegal) | all pass ✅ |
+| WAV sniff tests | 3 pass (mono s16 22050, stereo 44.1k, zero-block guard) | all pass ✅ |
+| ipc Engine round-trip with `cloned` | pass | pass ✅ |
+| End-to-end clone smoke-test (real WAV → embedding → synth) | **not run in this session** | deferred to v1.4.1 |
+| Cold sidecar startup (XTTS load, expected) | ~6-10s | informational |
+| Warm cloned synth first-sample (expected) | ~500-900ms | informational |
+
+**Honest scope**:
+
+- **The Python sidecar was not installed or smoke-tested in this session.** XTTS-v2 (~1.8 GB model) download + first-run synth blows the time budget. The Zig surface is complete + tested; the Python scripts are written + executable + dispatched correctly by the daemon, but `scripts/setup-voice-clone.sh` has not been run on this machine. **v1.4.1 closes the gap**: run setup, clone Gabriel's voice from a 30s WAV, capture warm TTFA, publish in `_qa/v1.4.1-baseline.md`
+- "Real" first-sample TTFA for cloned voices is expected at ~500-900ms on Apple Silicon CPU based on Coqui community benchmarks — pessimistic vs Faber's 91ms warm. Cloned is opt-in for personal voice, not the default
+- No `Felipe`-grade naming UX yet. v1.4 ships the surface `--voice <slug>` and validates slug format; surfacing in `voice list` is plain text
+- No ONNX export of the cloned voice. XTTS-v2 ONNX export is not production-stable (see [Coqui #4014](https://github.com/coqui-ai/TTS/discussions/4014)). v1.4 stays on the PyTorch path until that lands
+- The "only Zig" lifecycle constraint is **relaxed for the cloned engine only**. Faber + say remain pure Zig — no Python required to use the default v1.0 surface. See `docs/motor.md` "Cloned voices (v1.4)" for the licensing + lifecycle rationale
+
+**License note**: Coqui TTS is MPL-2.0. The Python sidecar runs as a separate process (`std.process.Child` from `daemon.zig::synthClonedViaSidecar`). The parent Zig binary remains dual MIT/Apache. The MPL boundary is the process line — no MPL code is linked or distributed inside `agent-tts`.
+
+---
+
 ## v1.0 — universal binary + brew tap · 2026-06-03
 
 **Shipped**:

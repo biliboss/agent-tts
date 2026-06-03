@@ -388,6 +388,23 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench-preproc", "Run preproc benchmark");
     bench_step.dependOn(&run_bench.step);
 
+    // v1.4: voice.zig stands alone (subcommand handler — no heavy imports).
+    // addTest only collects tests from the entry source, so to be sure the
+    // WAV sniff + slug validation tests run on every `zig build test`, point
+    // a dedicated step at the file. Mirrors the preproc pattern from v0.5.
+    const voice_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/voice.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_voice_tests = b.addRunArtifact(voice_tests);
+
+    // ipc_tests already defined above for the v1.1 multilingual surface;
+    // v1.4 added the `cloned` variant + test, which runs via that same step.
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -396,5 +413,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tts_tests.step);
     test_step.dependOn(&run_systemd_tests.step);
     test_step.dependOn(&run_detect_tests.step);
+    test_step.dependOn(&run_voice_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
 }

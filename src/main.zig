@@ -34,6 +34,7 @@ const systemd = @import("systemd.zig");
 const platform = @import("platform.zig");
 const ipc = @import("ipc.zig");
 const audio = @import("audio.zig");
+const voice = @import("voice.zig");
 const build_options = @import("build_options");
 
 pub const VERSION = "1.3.0";
@@ -54,7 +55,11 @@ const HELP =
     \\                                   (launchd on macOS, systemd on Linux)
     \\  agent-tts daemon uninstall       remove auto-start unit
     \\  agent-tts daemon status          print auto-start load state
+    \\  agent-tts voice clone            clone a voice from a 20-120s WAV (v1.4+)
+    \\    --sample <wav> --name <slug>
+    \\  agent-tts voice list             list installed voices (faber + cloned)
     \\  agent-tts --voice "Felipe" "texto"
+    \\  agent-tts --voice gabriel "..."  use a cloned voice (v1.4+)
     \\  agent-tts --rate 220 "texto"
     \\
     \\Piper backend (v0.7+):
@@ -153,6 +158,9 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, cmd, "ttfa-bench")) {
             return runTtfaBench(arena, io, home, args);
+        }
+        if (std.mem.eql(u8, cmd, "voice")) {
+            return voice.run(arena, io, home, args);
         }
         if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
             std.debug.print(HELP, .{VERSION});
@@ -298,6 +306,13 @@ fn runTtfaBench(
                 const text = try loadLongInput(arena, io);
                 try benchPiperLong(arena, io, home, warm, text);
             },
+        },
+        .cloned => {
+            std.debug.print(
+                "[ttfa-bench] engine=cloned not benchable from this path (sidecar startup dominates). " ++
+                    "Use `agent-tts --voice <slug> '...'` against a running daemon to measure end-to-end.\n",
+                .{},
+            );
         },
     }
 }

@@ -15,28 +15,6 @@ Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/ag
 
 ---
 
-## v1.4 — Voice cloning · *Your voice, your agent*
-
-> Faber is a great default. But the agent that ships your code should sound like you.
-
-**The problem today.** Every agent that uses `agent-tts` sounds identical. There is no personalization knob beyond `--voice "Felipe (Premium)"` for `say`.
-
-**What ships.** A `voice clone` subcommand. Drop a 30-second WAV in, get a custom ONNX checkpoint out. Drops into the same `voices/` directory as Faber and works with `--voice <slug>`.
-
-```bash
-agent-tts voice clone --sample me-reading.wav --name gabriel
-agent-tts --voice gabriel "Deploy concluído."
-```
-
-**Why now.** XTTS-v2 cloning works locally on Apple Silicon today. Wrapping it as a one-shot command is mostly UX.
-
-**Who cares.**
-- Solo devs branding their agent.
-- Studios where the AI narrator should match a human voiceover.
-- Accessibility users who want a familiar voice on their own machine.
-
----
-
 ## v1.5 — MCP server · *Native Claude Code voice*
 
 > Today, Claude Code shells out to `agent-tts` via Bash. That works, but it's not native. v1.5 makes the agent speak through the same protocol it reads.

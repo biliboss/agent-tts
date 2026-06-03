@@ -26,6 +26,7 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v1.1** | Multilingual: detect.zig + `--lang` + En Piper voice | 64/64 tests, host 897 KB, multi-piper boot 313 ms (Pt only) | 2026-06-03 |
 | **v1.2** | Sentence chunking + pipelined synth/playback | long-input first-audio **41-52 ms** (down from ~3 s), gap median 0.02 ms | 2026-06-03 |
 | **v1.3** | Cross-platform — Linux espeak-ng + systemd + CI matrix | macOS green, Linux green on CI, Windows compile-only | 2026-06-03 |
+| **v1.4** | `voice clone` + `voice list` + XTTS-v2 Python sidecar | surface + dispatch + 40/40 tests; install/smoke deferred to v1.4.1 | 2026-06-03 |
 
 ## KPI delivered
 
@@ -97,7 +98,6 @@ See [What's next](/whats-next/) for the marketing roadmap. Short version:
 
 | | Theme | Headline |
 |---|---|---|
-| v1.4 | Voice cloning | Your voice, your agent |
 | v1.5 | MCP server | Native Claude Code voice — drop the shell-out |
 
 ## Locked nots
