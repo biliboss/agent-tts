@@ -7,3 +7,7 @@ dist/
 
 .DS_Store
 *.log
+
+# v0.6 libpiper FFI: cloned C source + build artifacts (~400MB).
+# Reproduce via vendor/README.md. Voice models live in ~/.cache/agent-tts/voices/.
+vendor/piper1-gpl/
