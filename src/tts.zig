@@ -1,41 +1,34 @@
-// Drives macOS `say`. v0.2 still spawns a fresh `say` per message; pre-warm
-// is best-effort and may not survive across spawns. v1.0 will revisit
-// embedding AVSpeechSynthesizer via Cocoa if TTFA stalls above target.
+// Drives macOS `say`. v0.3 splits spawn from wait so the daemon worker can
+// register the child PID with the queue (for SKIP → SIGTERM) before blocking
+// on wait().
 
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
 pub const SAY_PATH = "/usr/bin/say";
 
-pub fn play(arena: std.mem.Allocator, io: std.Io, msg: ipc.Message) !void {
-    const rate_str = try std.fmt.allocPrint(arena, "{d}", .{msg.rate});
+pub const Spawned = struct {
+    child: std.process.Child,
+    rate_str: []const u8, // owned by arena passed to spawnSay
+};
 
+pub fn spawnSay(arena: std.mem.Allocator, io: std.Io, voice: []const u8, rate: u32, text: []const u8) !Spawned {
+    const rate_str = try std.fmt.allocPrint(arena, "{d}", .{rate});
     const argv = [_][]const u8{
         SAY_PATH,
         "-v",
-        msg.voice,
+        voice,
         "-r",
         rate_str,
-        msg.text,
+        text,
     };
-
-    var child = try std.process.spawn(io, .{
+    const child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            std.debug.print("[tts] say exited code={d}\n", .{code});
-            return error.SayFailed;
-        },
-        else => {
-            std.debug.print("[tts] say abnormal term\n", .{});
-            return error.SayFailed;
-        },
-    }
+    return .{ .child = child, .rate_str = rate_str };
 }
 
 // Pre-warm the Speech Synthesis Manager: empty utterance loads the voice

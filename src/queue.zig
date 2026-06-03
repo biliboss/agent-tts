@@ -1,38 +1,305 @@
-// Thread-safe FIFO queue of TTS messages.
+// v0.3 queue: SQLite WAL-backed FIFO.
 //
-// One producer (daemon accept loop) — many enqueue sources are serialized via
-// the mutex. One consumer (worker thread) — pop blocks on condition variable
-// when empty. close() drains and unblocks the consumer for clean shutdown.
+// Why SQLite instead of in-memory ArrayList:
+//   - Survives daemon crash + reboot (was v0.2 gap)
+//   - Enables `agent-tts queue` (read pending while worker drains)
+//   - WAL mode = single-writer (worker) never blocks readers (queue cmd)
+//
+// Concurrency model:
+//   - Single worker thread is the only writer of `state` transitions
+//     pending → playing → done|skipped.
+//   - daemon accept thread pushes new pending rows (also a writer, but
+//     INSERT-only and short-lived; serialized via the SQLite file lock).
+//   - QUEUE/SKIP/CLEAR ops execute on the daemon accept thread, mutate via
+//     short-lived UPDATEs, and use `currently_playing` for live SIGTERM.
+//
+// SKIP race handling:
+//   - `skipCurrent` updates state='skipped' WHERE id=playing.id AND state='playing'
+//   - Then sends SIGTERM to the cached pid (best-effort; race-safe-ish because
+//     pid recycling on macOS happens at multi-second timescales)
+//   - Worker, after `say` exits, checks DB state of the just-played item:
+//     if already 'skipped', leave it; else mark 'done'.
+//   - The `currently_playing` cell is set/cleared under `mu` so a CLEAR or
+//     SKIP that sees no row reports `OK\t0`.
+//
+// pop() blocks via std.Io.Condition when no pending rows exist. push()
+// signals after INSERT.
 
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
+const c = @cImport({
+    @cInclude("sqlite3.h");
+});
+
+// SQLite needs a destructor hint on bind_text. SQLITE_TRANSIENT = -1 cast to
+// a function pointer, which Zig refuses because of alignment. SQLITE_STATIC
+// = null tells SQLite "data won't change during step" — that holds for us
+// because text/voice live in either the read buffer or arena and the call
+// chain (bind → step → finalize) is synchronous, single-threaded per stmt.
+const sqlite_static: c.sqlite3_destructor_type = null;
+
+pub const QueueError = error{
+    DbOpen,
+    DbExec,
+    DbPrepare,
+    DbStep,
+    DbBind,
+    OutOfMemory,
+};
+
+pub const State = enum {
+    pending,
+    playing,
+    done,
+    skipped,
+
+    pub fn fromStr(s: []const u8) ?State {
+        if (std.mem.eql(u8, s, "pending")) return .pending;
+        if (std.mem.eql(u8, s, "playing")) return .playing;
+        if (std.mem.eql(u8, s, "done")) return .done;
+        if (std.mem.eql(u8, s, "skipped")) return .skipped;
+        return null;
+    }
+
+    pub fn str(s: State) []const u8 {
+        return @tagName(s);
+    }
+};
+
+pub const Item = struct {
+    id: u64,
+    state: State,
+    voice: []const u8,
+    rate: u32,
+    text: []const u8,
+};
+
+pub const PoppedItem = struct {
+    id: u64,
+    voice: []u8,
+    rate: u32,
+    text: []u8,
+};
+
+const SCHEMA =
+    \\CREATE TABLE IF NOT EXISTS items (
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  text TEXT NOT NULL,
+    \\  voice TEXT,
+    \\  rate INTEGER,
+    \\  state TEXT NOT NULL DEFAULT 'pending',
+    \\  enqueued_at INTEGER NOT NULL,
+    \\  started_at INTEGER,
+    \\  finished_at INTEGER
+    \\);
+    \\CREATE INDEX IF NOT EXISTS items_pending_idx ON items(state, id) WHERE state IN ('pending','playing');
+;
+
+const Playing = struct {
+    id: u64,
+    pid: std.posix.pid_t,
+};
+
 pub const Queue = struct {
     arena: std.mem.Allocator,
+    db: ?*c.sqlite3 = null,
     mu: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
-    items: std.ArrayList(ipc.Message) = .empty,
     closed: bool = false,
-    next_id: u64 = 1,
+    playing: ?Playing = null,
 
+    pub fn init(q: *Queue, db_path: []const u8) !void {
+        // Need a null-terminated C string for sqlite3_open.
+        var path_buf: [1024]u8 = undefined;
+        if (db_path.len + 1 > path_buf.len) return error.DbOpen;
+        @memcpy(path_buf[0..db_path.len], db_path);
+        path_buf[db_path.len] = 0;
+        const path_z: [*:0]const u8 = @ptrCast(&path_buf[0]);
+
+        if (c.sqlite3_open(path_z, &q.db) != c.SQLITE_OK) return error.DbOpen;
+
+        // WAL mode survives crash and lets readers (queue cmd) not block.
+        try execSimple(q.db, "PRAGMA journal_mode=WAL;");
+        try execSimple(q.db, "PRAGMA synchronous=NORMAL;");
+        try execSimple(q.db, "PRAGMA foreign_keys=ON;");
+        try execSimple(q.db, SCHEMA);
+
+        // Crash recovery: any row left in 'playing' from a prior daemon run
+        // belongs to a `say` that was killed by daemon death — re-queue it.
+        try execSimple(q.db, "UPDATE items SET state='pending', started_at=NULL WHERE state='playing';");
+    }
+
+    pub fn deinit(q: *Queue) void {
+        if (q.db) |db| {
+            _ = c.sqlite3_close(db);
+            q.db = null;
+        }
+    }
+
+    // INSERT a new pending item. Returns its rowid. Wakes worker via cond.
     pub fn push(q: *Queue, io: std.Io, msg: ipc.Message) !u64 {
         try q.mu.lock(io);
         defer q.mu.unlock(io);
-        try q.items.append(q.arena, msg);
-        const id = q.next_id;
-        q.next_id += 1;
+
+        const sql = "INSERT INTO items(text,voice,rate,state,enqueued_at) VALUES (?,?,?,'pending',?);";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DbPrepare;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (c.sqlite3_bind_text(stmt, 1, msg.text.ptr, @intCast(msg.text.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_text(stmt, 2, msg.voice.ptr, @intCast(msg.voice.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_int(stmt, 3, @intCast(msg.rate)) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_int64(stmt, 4, nowEpoch(io)) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+
+        const id: u64 = @intCast(c.sqlite3_last_insert_rowid(q.db));
         q.cond.signal(io);
         return id;
     }
 
-    pub fn pop(q: *Queue, io: std.Io) ?ipc.Message {
+    // Block until a pending row is available (or `closed`). Atomically flip it
+    // to 'playing' and return the data. Caller owns `voice`/`text` buffers
+    // (allocated from the daemon worker's GPA).
+    pub fn pop(q: *Queue, io: std.Io, gpa: std.mem.Allocator) ?PoppedItem {
         q.mu.lockUncancelable(io);
         defer q.mu.unlock(io);
-        while (q.items.items.len == 0 and !q.closed) {
+
+        while (true) {
+            if (q.closed) return null;
+            if (q.tryClaimNext(io, gpa)) |item| return item;
             q.cond.waitUncancelable(io, &q.mu);
         }
-        if (q.items.items.len == 0) return null; // closed
-        return q.items.orderedRemove(0);
+    }
+
+    // Returns next pending row marked 'playing'. Must be called under `mu`.
+    fn tryClaimNext(q: *Queue, io: std.Io, gpa: std.mem.Allocator) ?PoppedItem {
+        const sql_sel = "SELECT id, voice, rate, text FROM items WHERE state='pending' ORDER BY id ASC LIMIT 1;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql_sel, -1, &stmt, null) != c.SQLITE_OK) return null;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_ROW) return null;
+
+        const id: u64 = @intCast(c.sqlite3_column_int64(stmt, 0));
+        const voice = colText(gpa, stmt, 1) catch return null;
+        const rate: u32 = @intCast(c.sqlite3_column_int(stmt, 2));
+        const text = colText(gpa, stmt, 3) catch {
+            gpa.free(voice);
+            return null;
+        };
+
+        const sql_upd = "UPDATE items SET state='playing', started_at=? WHERE id=?;";
+        var ustmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql_upd, -1, &ustmt, null) != c.SQLITE_OK) {
+            gpa.free(voice);
+            gpa.free(text);
+            return null;
+        }
+        defer _ = c.sqlite3_finalize(ustmt);
+        _ = c.sqlite3_bind_int64(ustmt, 1, nowEpoch(io));
+        _ = c.sqlite3_bind_int64(ustmt, 2, @intCast(id));
+        if (c.sqlite3_step(ustmt) != c.SQLITE_DONE) {
+            gpa.free(voice);
+            gpa.free(text);
+            return null;
+        }
+
+        return .{ .id = id, .voice = voice, .rate = rate, .text = text };
+    }
+
+    // Worker calls after `say` finishes. If row is still 'playing', mark done.
+    // If skipCurrent already flipped it to 'skipped', leave it.
+    pub fn finishPlaying(q: *Queue, io: std.Io, id: u64) void {
+        q.mu.lockUncancelable(io);
+        defer q.mu.unlock(io);
+
+        q.playing = null;
+
+        const sql = "UPDATE items SET state='done', finished_at=? WHERE id=? AND state='playing';";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, nowEpoch(io));
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(id));
+        _ = c.sqlite3_step(stmt);
+    }
+
+    // Worker registers its child PID so SKIP can SIGTERM it.
+    pub fn setPlaying(q: *Queue, io: std.Io, id: u64, pid: std.posix.pid_t) void {
+        q.mu.lockUncancelable(io);
+        defer q.mu.unlock(io);
+        q.playing = .{ .id = id, .pid = pid };
+    }
+
+    // List pending + playing rows (snapshot). Allocates from `arena` so the
+    // daemon's per-request arena owns the strings; safe to return raw slices.
+    pub fn list(q: *Queue, io: std.Io, arena: std.mem.Allocator) ![]Item {
+        q.mu.lockUncancelable(io);
+        defer q.mu.unlock(io);
+
+        const sql = "SELECT id, state, voice, rate, text FROM items WHERE state IN ('pending','playing') ORDER BY id ASC;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DbPrepare;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var out: std.ArrayList(Item) = .empty;
+        defer out.deinit(arena);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id: u64 = @intCast(c.sqlite3_column_int64(stmt, 0));
+            const state_s = try colText(arena, stmt, 1);
+            const voice = try colText(arena, stmt, 2);
+            const rate: u32 = @intCast(c.sqlite3_column_int(stmt, 3));
+            const text = try colText(arena, stmt, 4);
+            try out.append(arena, .{
+                .id = id,
+                .state = State.fromStr(state_s) orelse .pending,
+                .voice = voice,
+                .rate = rate,
+                .text = text,
+            });
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    // Mark current playing as skipped + SIGTERM the child. Returns the id
+    // that was skipped, or 0 if nothing is currently playing.
+    pub fn skipCurrent(q: *Queue, io: std.Io) u64 {
+        q.mu.lockUncancelable(io);
+        defer q.mu.unlock(io);
+
+        const p = q.playing orelse return 0;
+
+        const sql = "UPDATE items SET state='skipped', finished_at=? WHERE id=? AND state='playing';";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return 0;
+        _ = c.sqlite3_bind_int64(stmt, 1, nowEpoch(io));
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(p.id));
+        const rc = c.sqlite3_step(stmt);
+        _ = c.sqlite3_finalize(stmt);
+        if (rc != c.SQLITE_DONE) return 0;
+
+        // SIGTERM the `say` child. Worker's wait() will return Term.signal;
+        // its finishPlaying() will see state='skipped' and not overwrite it.
+        std.posix.kill(p.pid, .TERM) catch {};
+        return p.id;
+    }
+
+    // Mark all pending as skipped. Does NOT touch the currently playing item
+    // (use `skipCurrent` for that). Returns count affected.
+    pub fn clearPending(q: *Queue, io: std.Io) u64 {
+        q.mu.lockUncancelable(io);
+        defer q.mu.unlock(io);
+
+        const sql = "UPDATE items SET state='skipped', finished_at=? WHERE state='pending';";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return 0;
+        _ = c.sqlite3_bind_int64(stmt, 1, nowEpoch(io));
+        const rc = c.sqlite3_step(stmt);
+        _ = c.sqlite3_finalize(stmt);
+        if (rc != c.SQLITE_DONE) return 0;
+        return @intCast(c.sqlite3_changes64(q.db));
     }
 
     pub fn close(q: *Queue, io: std.Io) void {
@@ -42,9 +309,37 @@ pub const Queue = struct {
         q.cond.broadcast(io);
     }
 
-    pub fn pending(q: *Queue, io: std.Io) usize {
+    pub fn pending(q: *Queue, io: std.Io) u64 {
         q.mu.lockUncancelable(io);
         defer q.mu.unlock(io);
-        return q.items.items.len;
+
+        const sql = "SELECT COUNT(*) FROM items WHERE state='pending';";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return 0;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return 0;
+        return @intCast(c.sqlite3_column_int64(stmt, 0));
     }
 };
+
+// ---- helpers ----
+
+fn execSimple(db: ?*c.sqlite3, sql: [*c]const u8) !void {
+    var err: [*c]u8 = null;
+    if (c.sqlite3_exec(db, sql, null, null, &err) != c.SQLITE_OK) {
+        if (err != null) c.sqlite3_free(err);
+        return error.DbExec;
+    }
+}
+
+fn colText(allocator: std.mem.Allocator, stmt: ?*c.sqlite3_stmt, col: c_int) ![]u8 {
+    const ptr = c.sqlite3_column_text(stmt, col);
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+    const out = try allocator.alloc(u8, len);
+    if (len > 0) @memcpy(out, ptr[0..len]);
+    return out;
+}
+
+fn nowEpoch(io: std.Io) i64 {
+    return std.Io.Clock.now(.real, io).toSeconds();
+}

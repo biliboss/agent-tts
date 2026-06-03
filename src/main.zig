@@ -1,16 +1,18 @@
-// agent-tts v0.2 — Pt-BR TTS via macOS `say`, with persistent daemon.
+// agent-tts v0.3 — Pt-BR TTS via macOS `say`, persistent daemon, SQLite WAL queue.
 //
 // Entry point. Routes argv:
 //   agent-tts daemon         → daemon mode
+//   agent-tts queue          → client: list pending+playing items
+//   agent-tts skip           → client: skip current playing item
+//   agent-tts clear          → client: drop all pending items
 //   agent-tts -h | --help    → help
 //   agent-tts -V | --version → version
-//   agent-tts ...            → client mode (enqueue to running daemon)
+//   agent-tts ...            → client: enqueue text on running daemon
 //
-// v0.2 scope locked by docs/roadmap.md:
-//   - Foreground daemon (no auto-start; v0.4 brings launchd)
-//   - UNIX socket IPC + in-memory FIFO queue
-//   - Pre-warm of Luciana voice on daemon boot
-//   - Worker thread drains queue serially (never parallel `say`)
+// v0.3 scope locked by docs/roadmap.md:
+//   - SQLite WAL queue at ~/.cache/agent-tts/queue.db (survives crash/reboot)
+//   - QUEUE/SKIP/CLEAR ops over UNIX socket
+//   - Worker rewrite: drains via SQLite, registers child PID for SKIP-kill
 //
 // KPI = time-to-first-audio (TTFA). Client measures round-trip ACK; real TTFA
 // still needs dtruss + audio capture (roadmap _qa/).
@@ -20,13 +22,16 @@ const std = @import("std");
 const client = @import("client.zig");
 const daemon = @import("daemon.zig");
 
-pub const VERSION = "0.2.0";
+pub const VERSION = "0.3.0";
 
 const HELP =
     \\agent-tts v{s} — Pt-BR TTS via macOS `say`
     \\
     \\Usage:
     \\  agent-tts "texto"                send to running daemon
+    \\  agent-tts queue                  list pending + playing items
+    \\  agent-tts skip                   skip current playing item
+    \\  agent-tts clear                  drop all pending items
     \\  agent-tts daemon                 run daemon (foreground)
     \\  agent-tts --voice "Felipe" "texto"
     \\  agent-tts --rate 220 "texto"
@@ -37,7 +42,7 @@ const HELP =
     \\  -h, --help     this help
     \\  -V, --version  print version
     \\
-    \\v0.2 needs `agent-tts daemon` running in another terminal.
+    \\v0.3 needs `agent-tts daemon` running in another terminal.
     \\Auto-start arrives in v0.4 (launchd).
     \\
 ;

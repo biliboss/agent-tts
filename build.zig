@@ -70,6 +70,11 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            // v0.3: SQLite WAL queue persists in ~/.cache/agent-tts/queue.db.
+            // macOS ships libsqlite3 in the SDK sysroot; @cImport in queue.zig
+            // pulls sqlite3.h from the same place. link_libc required for the
+            // C header to resolve typedefs (size_t, etc).
+            .link_libc = true,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
@@ -82,6 +87,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.linkSystemLibrary("sqlite3", .{});
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
