@@ -32,6 +32,7 @@ export default defineConfig({
         { label: 'TTS engine', link: '/motor/' },
         { label: 'Roadmap', link: '/roadmap/' },
         { label: "What's next", link: '/whats-next/' },
+        { label: 'MCP server', link: '/mcp/' },
         { label: 'Changelog', link: '/changelog/' },
       ],
     }),

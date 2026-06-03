@@ -11,10 +11,20 @@
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
-const DEFAULT_VOICE = "Luciana";
-const DEFAULT_RATE: u32 = 330;
+pub const DEFAULT_VOICE = "Luciana";
+pub const DEFAULT_RATE: u32 = 330;
 const READ_BUF = 64 * 1024;
 const WRITE_BUF = 16 * 1024;
+
+/// Single ITEM row returned by `queueLines`. Slices live in caller arena.
+pub const QueueItem = struct {
+    id: []const u8,
+    state: []const u8,
+    engine: []const u8,
+    voice: []const u8,
+    rate: []const u8,
+    text: []const u8,
+};
 
 const HELP =
     \\agent-tts — Pt-BR TTS via macOS `say` or libpiper (v0.7+)
@@ -258,4 +268,152 @@ fn openSocket(arena: std.mem.Allocator, io: std.Io, home: []const u8) !std.Io.ne
         std.process.exit(1);
     };
     return stream;
+}
+
+// ---- v1.5: helpers reused by mcp.zig ----------------------------------
+//
+// The MCP server in `mcp.zig` is a thin shim over the same UNIX socket the
+// CLI uses. These helpers expose ENQUEUE/QUEUE/SKIP/CLEAR as pure functions
+// returning data — no stdout writes, no process.exit. The CLI commands above
+// stay verbose because they are user-facing; these are for tool callers.
+
+pub const ClientError = error{
+    DaemonUnreachable,
+    DaemonError,
+    UnexpectedResponse,
+};
+
+fn openSocketSilent(arena: std.mem.Allocator, io: std.Io, home: []const u8) !std.Io.net.Stream {
+    const sock_path = try ipc.socketPath(arena, io, home);
+    var addr = try std.Io.net.UnixAddress.init(sock_path);
+    return addr.connect(io) catch return error.DaemonUnreachable;
+}
+
+/// Enqueue a TTS item on the running daemon and return its id as a string.
+/// Slice is owned by `arena`. Sanitizes `text` (tabs/newlines → spaces).
+pub fn enqueueLine(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    engine: ipc.Engine,
+    voice: []const u8,
+    rate: u32,
+    text: []const u8,
+) ![]u8 {
+    const clean = try ipc.sanitizeText(arena, text);
+    const msg = ipc.Message{ .engine = engine, .voice = voice, .rate = rate, .text = clean };
+
+    var stream = try openSocketSilent(arena, io, home);
+    defer stream.close(io);
+
+    var read_buf: [READ_BUF]u8 = undefined;
+    var write_buf: [WRITE_BUF]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var sw = stream.writer(io, &write_buf);
+
+    try sw.interface.print("ENQUEUE\t{s}\t{s}\t{d}\t{s}\n", .{ msg.engine.str(), msg.voice, msg.rate, msg.text });
+    try sw.interface.flush();
+
+    const line = try sr.interface.takeDelimiterExclusive('\n');
+    if (std.mem.startsWith(u8, line, "OK\t")) return try arena.dupe(u8, line[3..]);
+    if (std.mem.startsWith(u8, line, "ERR\t")) return error.DaemonError;
+    return error.UnexpectedResponse;
+}
+
+/// Returns all items currently in the queue (pending + playing). Slices live
+/// in `arena`. Empty list when the queue is empty.
+pub fn queueLines(arena: std.mem.Allocator, io: std.Io, home: []const u8) ![]QueueItem {
+    var stream = try openSocketSilent(arena, io, home);
+    defer stream.close(io);
+
+    var read_buf: [READ_BUF]u8 = undefined;
+    var write_buf: [128]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var sw = stream.writer(io, &write_buf);
+
+    try sw.interface.writeAll("QUEUE\n");
+    try sw.interface.flush();
+
+    var list: std.ArrayList(QueueItem) = .empty;
+    while (true) {
+        const raw = try sr.interface.takeDelimiterInclusive('\n');
+        const line = if (raw.len > 0 and raw[raw.len - 1] == '\n') raw[0 .. raw.len - 1] else raw;
+        if (std.mem.eql(u8, line, "END")) break;
+        if (std.mem.startsWith(u8, line, "ERR\t")) return error.DaemonError;
+        if (!std.mem.startsWith(u8, line, "ITEM\t")) continue;
+
+        const rest = line[5..];
+        var it = std.mem.splitScalar(u8, rest, '\t');
+        const id = it.next() orelse continue;
+        const state = it.next() orelse continue;
+        const engine_or_voice = it.next() orelse continue;
+        const next_field = it.next() orelse continue;
+        var engine: []const u8 = "say";
+        var voice: []const u8 = engine_or_voice;
+        var rate_s: []const u8 = next_field;
+        if (std.mem.eql(u8, engine_or_voice, "say") or std.mem.eql(u8, engine_or_voice, "piper")) {
+            engine = engine_or_voice;
+            voice = next_field;
+            rate_s = it.next() orelse continue;
+        }
+        const text = it.rest();
+        try list.append(arena, .{
+            .id = try arena.dupe(u8, id),
+            .state = try arena.dupe(u8, state),
+            .engine = try arena.dupe(u8, engine),
+            .voice = try arena.dupe(u8, voice),
+            .rate = try arena.dupe(u8, rate_s),
+            .text = try arena.dupe(u8, text),
+        });
+    }
+    return list.toOwnedSlice(arena);
+}
+
+/// Returns the id of the skipped item (0 = nothing was playing).
+pub fn skipOp(arena: std.mem.Allocator, io: std.Io, home: []const u8) !u64 {
+    const line = try simpleOpSilent(arena, io, home, "SKIP\n");
+    if (!std.mem.startsWith(u8, line, "OK\t")) return error.UnexpectedResponse;
+    return std.fmt.parseInt(u64, line[3..], 10) catch return error.UnexpectedResponse;
+}
+
+/// Returns the number of items dropped from the pending queue.
+pub fn clearOp(arena: std.mem.Allocator, io: std.Io, home: []const u8) !u64 {
+    const line = try simpleOpSilent(arena, io, home, "CLEAR\n");
+    if (!std.mem.startsWith(u8, line, "OK\t")) return error.UnexpectedResponse;
+    return std.fmt.parseInt(u64, line[3..], 10) catch return error.UnexpectedResponse;
+}
+
+fn simpleOpSilent(arena: std.mem.Allocator, io: std.Io, home: []const u8, cmd: []const u8) ![]u8 {
+    var stream = try openSocketSilent(arena, io, home);
+    defer stream.close(io);
+
+    var read_buf: [READ_BUF]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var sw = stream.writer(io, &write_buf);
+
+    try sw.interface.writeAll(cmd);
+    try sw.interface.flush();
+
+    const line = try sr.interface.takeDelimiterExclusive('\n');
+    if (std.mem.startsWith(u8, line, "ERR\t")) return error.DaemonError;
+    return try arena.dupe(u8, line);
+}
+
+// ---- tests ------------------------------------------------------------
+
+test "QueueItem struct holds the 6 fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const it: QueueItem = .{
+        .id = try a.dupe(u8, "42"),
+        .state = try a.dupe(u8, "pending"),
+        .engine = try a.dupe(u8, "piper"),
+        .voice = try a.dupe(u8, "faber"),
+        .rate = try a.dupe(u8, "330"),
+        .text = try a.dupe(u8, "olá"),
+    };
+    try std.testing.expectEqualStrings("42", it.id);
+    try std.testing.expectEqualStrings("piper", it.engine);
 }

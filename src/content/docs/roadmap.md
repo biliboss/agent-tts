@@ -1,15 +1,15 @@
 ---
 title: Roadmap
-description: v0.1 → v1.0 shipped 2026-06-03 in a single session. v1.1 → v1.5 in What's next.
+description: v0.1 → v1.0 shipped 2026-06-03 in a single session. v1.5 added native MCP. v1.1 → v1.4 in What's next.
 ---
 
 ## TL;DR
 
-v0.1 → v1.0 shipped on **2026-06-03**, in one session, behind one KPI. Eight milestones, each with a published measurement. Universal binary, brew tap, and launchd auto-start landed in v1.0.
+v0.1 → v1.0 shipped on **2026-06-03**, in one session, behind one KPI. Eight milestones, each with a published measurement. Universal binary, brew tap, and launchd auto-start landed in v1.0. v1.5 added the stdio JSON-RPC MCP server so Claude Code, Cursor, and Cline can talk to agent-tts directly.
 
-v1.1 and beyond are scoped for marketing and engineering value in [What's next](/whats-next/).
+v1.1 → v1.4 are scoped for marketing and engineering value in [What's next](/whats-next/).
 
-## v0.1 → v1.0 — Shipped
+## v0.1 → v1.5 — Shipped
 
 Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss/agent-tts/tree/main/_qa) and a section in the [Changelog](/changelog/).
 
@@ -23,6 +23,7 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v0.6** | libpiper FFI baseline | piper init 400 ms, synth + WAV 100 ms warm | 2026-06-03 |
 | **v0.7** | zaudio streaming + `--engine say\|piper` routing | piper synth warm **91 ms** | 2026-06-03 |
 | **v1.0** | Universal binary + brew formula + GitHub Pages docs | universal 1.8 MB, host 918 KB | 2026-06-03 |
+| **v1.5** | MCP server: stdio JSON-RPC, 5 tools, native Claude Code voice | binary 993 KB (+115 KB), tools-only scope | 2026-06-03 |
 
 ## KPI delivered
 
@@ -63,7 +64,7 @@ zig build -Doptimize=ReleaseFast -Dwith-piper=true
 
 launchd plist lives at `~/Library/LaunchAgents/io.github.biliboss.agent-tts.plist`.
 
-## What's next (v1.1 → v1.5)
+## What's next (v1.1 → v1.4)
 
 See [What's next](/whats-next/) for the marketing roadmap. Short version:
 
@@ -73,7 +74,6 @@ See [What's next](/whats-next/) for the marketing roadmap. Short version:
 | v1.2 | Streaming | First word before the last is written |
 | v1.3 | Cross-platform | agent-tts on Linux (and Windows when you ask) |
 | v1.4 | Voice cloning | Your voice, your agent |
-| v1.5 | MCP server | Native Claude Code voice — drop the shell-out |
 
 ## Locked nots
 

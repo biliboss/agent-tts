@@ -30,9 +30,10 @@ const daemon = @import("daemon.zig");
 const launchd = @import("launchd.zig");
 const ipc = @import("ipc.zig");
 const audio = @import("audio.zig");
+const mcp = @import("mcp.zig");
 const build_options = @import("build_options");
 
-pub const VERSION = "1.0.0";
+pub const VERSION = "1.5.0";
 
 const HELP =
     \\agent-tts v{s} — Pt-BR TTS via macOS `say` or libpiper
@@ -47,6 +48,7 @@ const HELP =
     \\  agent-tts daemon install         install launchd LaunchAgent (auto-start)
     \\  agent-tts daemon uninstall       remove launchd LaunchAgent
     \\  agent-tts daemon status          print launchd load state
+    \\  agent-tts mcp                    speak over stdio MCP (Claude Code / Cursor / Cline)
     \\  agent-tts --voice "Felipe" "texto"
     \\  agent-tts --rate 220 "texto"
     \\
@@ -70,6 +72,10 @@ const HELP =
     \\
     \\launchd plist lives at ~/Library/LaunchAgents/io.github.biliboss.agent-tts.plist
     \\(override label via AGENT_TTS_LAUNCHD_LABEL env var — used by tests).
+    \\
+    \\Claude Code MCP wire-up (single line in ~/.claude.json):
+    \\  "mcpServers": {{ "agent-tts": {{ "command": "agent-tts", "args": ["mcp"] }} }}
+    \\See ./scripts/install-mcp.sh for an idempotent installer.
     \\
 ;
 
@@ -105,6 +111,9 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, cmd, "ttfa-bench")) {
             return runTtfaBench(arena, io, home, args);
+        }
+        if (std.mem.eql(u8, cmd, "mcp")) {
+            return mcp.run(arena, io, home);
         }
         if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
             std.debug.print(HELP, .{VERSION});
