@@ -30,6 +30,7 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v1.5** | MCP server: stdio JSON-RPC, 5 tools, native Claude Code voice | binary 993 KB (+115 KB), tools-only scope | 2026-06-03 |
 | **v1.6** | Voice cloning ship-it: setup-voice-clone.sh validated, real Gabriel voice, `voice list` shows duration + rate, bench script | clone 23.4s, cold synth 26.4s → 4.3s audio, 67/67 tests, 5 install blockers fixed | 2026-06-03 |
 | **v1.7** | Streaming text input: `agent-tts stream` + `say_stream` MCP tool + incremental chunker | 166/166 tests, end-to-end CLI + MCP green, latency bench wired | 2026-06-03 |
+| **v1.8** | SSML 1.1 subset: `<emphasis>` / `<break>` / `<prosody>` / `<say-as>` for `say` + Piper | parse < 0.2 µs / 280 chars, +16 ssml tests + 5 ipc tests | 2026-06-03 |
 
 ## KPI delivered
 

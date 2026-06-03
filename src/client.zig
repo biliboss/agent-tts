@@ -41,6 +41,8 @@ const HELP =
     \\  --lang auto|pt|en   language routing (default: auto; piper-only)
     \\  --voice NAME        voice name (default: Luciana for say, faber for piper)
     \\  --rate WPM          words per minute (default: 330; ignored by piper)
+    \\  --ssml              treat text as W3C SSML 1.1 subset (v1.8+;
+    \\                      <emphasis> <break> <prosody> <say-as>)
     \\  -h, --help          this help
     \\  -V, --version       print version
     \\
@@ -64,6 +66,7 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     var lang: ipc.Lang = .auto;
     var voice_arg: ?[]const u8 = null;
     var rate: u32 = DEFAULT_RATE;
+    var ssml_flag: bool = false;
     var text: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -107,6 +110,10 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
                 std.debug.print("error: --rate invalid (got '{s}')\n", .{args[i]});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, a, "--ssml")) {
+            // v1.8 — boolean toggle. Daemon parses W3C SSML subset.
+            // Skip sanitisation of `<`/`>` so markup survives.
+            ssml_flag = true;
         } else {
             text = a;
         }
@@ -147,6 +154,7 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
         .lang = lang,
         .voice = voice,
         .rate = rate,
+        .ssml = ssml_flag,
         .text = clean,
     };
 
@@ -159,11 +167,13 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     var sw = stream.writer(io, &write_buf);
 
     const t_start = std.Io.Clock.now(.awake, io);
-    // v1.1 6-field ENQUEUE: engine, lang, voice, rate, text. Daemon handles
-    // older 4/5-field forms for ABI compatibility — see ipc.parseRequest.
+    // v1.8 7-field ENQUEUE: engine, lang, voice, rate, ssml, text. Daemon
+    // handles older 4/5/6-field forms for ABI compatibility — see
+    // ipc.parseRequest for the disambiguation rules.
+    const ssml_wire: []const u8 = if (msg.ssml) "1" else "0";
     try sw.interface.print(
-        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\n",
-        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, msg.text },
+        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\n",
+        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_wire, msg.text },
     );
     try sw.interface.flush();
 
@@ -365,8 +375,30 @@ pub fn enqueueLine(
     rate: u32,
     text: []const u8,
 ) ![]u8 {
+    return enqueueLineSsml(arena, io, home, engine, voice, rate, text, false);
+}
+
+/// v1.8 — enqueue with the SSML flag. Same wire as the CLI's 7-field
+/// ENQUEUE; daemon parses SSML when `ssml_flag` is true and routes
+/// per-engine. MCP `say` tool uses this when its `ssml` argument is set.
+pub fn enqueueLineSsml(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    engine: ipc.Engine,
+    voice: []const u8,
+    rate: u32,
+    text: []const u8,
+    ssml_flag: bool,
+) ![]u8 {
     const clean = try ipc.sanitizeText(arena, text);
-    const msg = ipc.Message{ .engine = engine, .voice = voice, .rate = rate, .text = clean };
+    const msg = ipc.Message{
+        .engine = engine,
+        .voice = voice,
+        .rate = rate,
+        .ssml = ssml_flag,
+        .text = clean,
+    };
 
     var stream = try openSocketSilent(arena, io, home);
     defer stream.close(io);
@@ -376,7 +408,11 @@ pub fn enqueueLine(
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);
 
-    try sw.interface.print("ENQUEUE\t{s}\t{s}\t{d}\t{s}\n", .{ msg.engine.str(), msg.voice, msg.rate, msg.text });
+    const ssml_wire: []const u8 = if (msg.ssml) "1" else "0";
+    try sw.interface.print(
+        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\n",
+        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_wire, msg.text },
+    );
     try sw.interface.flush();
 
     const line = try sr.interface.takeDelimiterExclusive('\n');

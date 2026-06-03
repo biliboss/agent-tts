@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const detect = @import("detect.zig");
+const ssml = @import("ssml.zig");
 
 // ─── v1.1: sentence-level language chunks ────────────────────────────────
 //
@@ -157,6 +158,28 @@ pub fn process(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
     const after_numbers = try expandNumbers(arena, after_abbrev);
     const after_pauses = try insertPauses(arena, after_numbers);
     return after_pauses;
+}
+
+/// v1.8 — SSML-aware processing for the macOS `say` engine. Parses the
+/// SSML subset, transpiles to `[[…]] directives`, and skips the
+/// abbreviation/cardinal expansion (markup contains the agent's intent
+/// verbatim — applying Pt-BR cardinals to "<say-as interpret-as=\"digits\">42</say-as>"
+/// would defeat the markup). Caller's `[[slnc]]` pauses are emitted by
+/// the SSML transpiler, not by `insertPauses`.
+pub fn processSayWithSsml(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (raw.len == 0) return arena.alloc(u8, 0);
+    const tokens = try ssml.parse(arena, raw);
+    return try ssml.transpileToSay(arena, tokens);
+}
+
+/// v1.8 — strip SSML tags and apply the v0.5 preproc to the plain text.
+/// Used by engines that can't (or don't yet) honour SSML at the
+/// per-utterance level (piper without prosody re-synth, espeak-ng).
+pub fn processSsmlStripped(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (raw.len == 0) return arena.alloc(u8, 0);
+    const tokens = try ssml.parse(arena, raw);
+    const plain = try ssml.stripToPlain(arena, tokens);
+    return try process(arena, plain);
 }
 
 // ──────────────────────────────────────────────────────────────────────

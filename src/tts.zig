@@ -37,11 +37,40 @@ pub const Spawned = struct {
 };
 
 pub fn spawnSay(arena: std.mem.Allocator, io: std.Io, voice: []const u8, rate: u32, text: []const u8) !Spawned {
+    return spawnSayMaybeSsml(arena, io, voice, rate, text, false);
+}
+
+/// v1.8 — same as `spawnSay` but routes through the SSML preprocessor
+/// when `is_ssml` is true. macOS-only path emits `[[…]]` directives so
+/// `say` honours emphasis / breaks / prosody. Other platforms strip
+/// markup and fall back to the v0.5 preproc on the plain text.
+pub fn spawnSayMaybeSsml(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    voice: []const u8,
+    rate: u32,
+    text: []const u8,
+    is_ssml: bool,
+) !Spawned {
     const rate_str = try std.fmt.allocPrint(arena, "{d}", .{rate});
 
-    const spoken: []const u8 = preproc.process(arena, text) catch |e| blk: {
-        std.debug.print("[tts] preproc failed ({s}); falling back to raw text\n", .{@errorName(e)});
-        break :blk text;
+    const spoken: []const u8 = blk: {
+        if (is_ssml) {
+            switch (comptime platform.current()) {
+                .macos => break :blk preproc.processSayWithSsml(arena, text) catch |e| {
+                    std.debug.print("[tts] ssml preproc failed ({s}); falling back to raw text\n", .{@errorName(e)});
+                    break :blk text;
+                },
+                else => break :blk preproc.processSsmlStripped(arena, text) catch |e| {
+                    std.debug.print("[tts] ssml strip failed ({s}); falling back to raw text\n", .{@errorName(e)});
+                    break :blk text;
+                },
+            }
+        }
+        break :blk preproc.process(arena, text) catch |e| {
+            std.debug.print("[tts] preproc failed ({s}); falling back to raw text\n", .{@errorName(e)});
+            break :blk text;
+        };
     };
 
     // Per-platform argv. Comptime switch so dead branches drop out of the

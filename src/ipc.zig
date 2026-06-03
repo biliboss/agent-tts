@@ -4,22 +4,27 @@
 // Transport: UNIX stream socket at $HOME/.cache/agent-tts/sock
 //
 // Request lines (one per connection):
-//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<text>\n  → v1.1 6-field form
-//   ENQUEUE\t<engine>\t<voice>\t<rate>\t<text>\n          → v0.7 5-field form
-//   ENQUEUE\t<voice>\t<rate>\t<text>\n                    → v0.6 4-field form
-//   QUEUE\n                                               → list items
-//   SKIP\n                                                → skip current
-//   CLEAR\n                                               → drop pending
+//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<ssml>\t<text>\n → v1.8 7-field form
+//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<text>\n         → v1.1 6-field form
+//   ENQUEUE\t<engine>\t<voice>\t<rate>\t<text>\n                 → v0.7 5-field form
+//   ENQUEUE\t<voice>\t<rate>\t<text>\n                           → v0.6 4-field form
+//   QUEUE\n                                                      → list items
+//   SKIP\n                                                       → skip current
+//   CLEAR\n                                                      → drop pending
 //
 // Backward compat (parseRequest):
 //   1. Peek first token after ENQUEUE.
-//      - Engine.fromStr matches      → new layout (v0.7 or v1.1)
+//      - Engine.fromStr matches      → new layout (v0.7+)
 //      - Not an engine               → legacy v0.6 (token is the voice)
 //   2. In new layout, peek the second token.
-//      - Lang.fromStr matches        → v1.1 6-field
+//      - Lang.fromStr matches        → v1.1+ (6-field or 7-field)
 //      - Not a lang                  → v0.7 5-field (token is the voice)
+//   3. In v1.1+ layout, peek the field after the rate.
+//      - "0" / "1" exactly           → v1.8 7-field (token is the ssml flag)
+//      - Anything else               → v1.1 6-field (rest is text)
 //
-// Lang defaults to `.auto` when absent so v0.6/v0.7 clients keep working.
+// Lang defaults to `.auto` and ssml defaults to `false` when absent so
+// v0.6/v0.7/v1.1 clients keep working unchanged.
 //
 // Response lines:
 //   OK\t<id>\n                           → enqueue/skip/clear ack
@@ -77,6 +82,11 @@ pub const Message = struct {
     lang: Lang = .auto,
     voice: []const u8,
     rate: u32,
+    /// v1.8 — input contains W3C SSML 1.1 subset markup. When `false`,
+    /// the daemon runs the v0.5 Pt-BR preprocessor as before. When
+    /// `true`, the daemon parses SSML, applies engine-specific transpile
+    /// (say → [[…]] directives, piper → prosody scaling), then routes.
+    ssml: bool = false,
     text: []const u8,
 };
 
@@ -111,10 +121,15 @@ pub fn sanitizeText(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
 }
 
 pub fn encodeEnqueue(arena: std.mem.Allocator, msg: Message) ![]u8 {
+    // v1.8 wire format: 7 fields. Daemon parser recognises the ssml flag
+    // by exact "0"/"1" match between rate and text — anything else (e.g.
+    // a v1.1 client's text starting with a digit followed by a tab) falls
+    // back to v1.1 6-field parsing.
+    const ssml_str: []const u8 = if (msg.ssml) "1" else "0";
     return try std.fmt.allocPrint(
         arena,
-        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\n",
-        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, msg.text },
+        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\n",
+        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_str, msg.text },
     );
 }
 
@@ -127,22 +142,58 @@ pub fn parseRequest(arena: std.mem.Allocator, line: []const u8) ParseError!Reque
     if (std.mem.eql(u8, op, "ENQUEUE")) {
         const first = it.next() orelse return error.Malformed;
         if (Engine.fromStr(first)) |engine| {
-            // New layout (v0.7 or v1.1). Peek the next field for Lang.
+            // New layout (v0.7 or v1.1+). Peek the next field for Lang.
             const second = it.next() orelse return error.Malformed;
             if (Lang.fromStr(second)) |lang| {
-                // v1.1 6-field: ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<text>
+                // v1.1 6-field or v1.8 7-field. Both share the prefix
+                // ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>; the
+                // disambiguator sits between rate and text.
                 const voice = it.next() orelse return error.Malformed;
                 const rate_str = it.next() orelse return error.Malformed;
-                const text = it.rest();
-                if (text.len == 0) return error.Malformed;
+                const after_rate = it.next() orelse return error.Malformed;
                 const rate = std.fmt.parseInt(u32, rate_str, 10) catch return error.InvalidRate;
                 const voice_dup = arena.dupe(u8, voice) catch return error.Malformed;
-                const text_dup = arena.dupe(u8, text) catch return error.Malformed;
+
+                // v1.8: a bare "0" or "1" between rate and text marks the
+                // ssml flag. Old clients send text directly — anything
+                // longer than one byte or not in {'0','1'} keeps the
+                // v1.1 6-field shape (after_rate IS the text).
+                if (after_rate.len == 1 and (after_rate[0] == '0' or after_rate[0] == '1')) {
+                    const text = it.rest();
+                    if (text.len == 0) return error.Malformed;
+                    const text_dup = arena.dupe(u8, text) catch return error.Malformed;
+                    return .{ .enqueue = .{
+                        .engine = engine,
+                        .lang = lang,
+                        .voice = voice_dup,
+                        .rate = rate,
+                        .ssml = after_rate[0] == '1',
+                        .text = text_dup,
+                    } };
+                }
+
+                // v1.1 6-field — after_rate is the first text field; we
+                // need to splice it back together with whatever the
+                // iterator still has.
+                const rest = it.rest();
+                const text_dup = blk: {
+                    if (rest.len == 0) {
+                        const dup = arena.dupe(u8, after_rate) catch return error.Malformed;
+                        break :blk dup;
+                    }
+                    const total = arena.alloc(u8, after_rate.len + 1 + rest.len) catch return error.Malformed;
+                    @memcpy(total[0..after_rate.len], after_rate);
+                    total[after_rate.len] = '\t';
+                    @memcpy(total[after_rate.len + 1 ..], rest);
+                    break :blk total;
+                };
+                if (text_dup.len == 0) return error.Malformed;
                 return .{ .enqueue = .{
                     .engine = engine,
                     .lang = lang,
                     .voice = voice_dup,
                     .rate = rate,
+                    .ssml = false,
                     .text = text_dup,
                 } };
             }
@@ -276,6 +327,74 @@ test "Lang.fromStr accepts known langs only" {
     try std.testing.expectEqual(Lang.en, Lang.fromStr("en").?);
     try std.testing.expect(Lang.fromStr("fr") == null);
     try std.testing.expect(Lang.fromStr("Luciana") == null);
+}
+
+test "parseRequest v1.8 7-field ENQUEUE with ssml=1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tsay\tpt\tLuciana\t330\t1\t<emphasis>Olá</emphasis>",
+    );
+    try std.testing.expectEqual(Engine.say, req.enqueue.engine);
+    try std.testing.expectEqual(Lang.pt, req.enqueue.lang);
+    try std.testing.expectEqual(true, req.enqueue.ssml);
+    try std.testing.expectEqualStrings("<emphasis>Olá</emphasis>", req.enqueue.text);
+}
+
+test "parseRequest v1.8 7-field ENQUEUE with ssml=0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tauto\tfaber\t330\t0\tOlá mundo",
+    );
+    try std.testing.expectEqual(false, req.enqueue.ssml);
+    try std.testing.expectEqualStrings("Olá mundo", req.enqueue.text);
+}
+
+test "parseRequest v1.1 text starting with digit is not misread as ssml flag" {
+    // A v1.1 client sending text "1 dois 3" must still parse as v1.1 (ssml=false).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t1 dois 3",
+    );
+    try std.testing.expectEqual(false, req.enqueue.ssml);
+    try std.testing.expectEqualStrings("1 dois 3", req.enqueue.text);
+}
+
+test "parseRequest v1.1 6-field still works (ssml defaults false)" {
+    // Backward-compat: pre-v1.8 clients omit the ssml field. Parser must
+    // recognise the absence and default to ssml=false.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\tOlá mundo",
+    );
+    try std.testing.expectEqual(false, req.enqueue.ssml);
+    try std.testing.expectEqualStrings("Olá mundo", req.enqueue.text);
+}
+
+test "encodeEnqueue v1.8 round-trips ssml flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original: Message = .{
+        .engine = .say,
+        .lang = .pt,
+        .voice = "Luciana",
+        .rate = 300,
+        .ssml = true,
+        .text = "<emphasis>Olá</emphasis>",
+    };
+    const wire = try encodeEnqueue(a, original);
+    const line = wire[0 .. wire.len - 1];
+    const req = try parseRequest(a, line);
+    try std.testing.expectEqual(true, req.enqueue.ssml);
+    try std.testing.expectEqualStrings(original.text, req.enqueue.text);
 }
 
 test "parseRequest legacy 5-field ENQUEUE with cloned engine (no lang)" {

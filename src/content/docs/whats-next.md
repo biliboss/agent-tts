@@ -1,39 +1,17 @@
 ---
 title: What's next
-description: Three next versions of agent-tts (v1.8 → v1.10) — SSML/prosody, web playground, and menubar UI.
+description: Two next versions of agent-tts (v1.9, v1.10) — web playground and menubar UI.
 ---
 
 ## TL;DR
 
-**v1.6 + v1.7 shipped on 2026-06-03** — voice cloning is real (baseline in [`_qa/v1.6-baseline.md`](https://github.com/biliboss/agent-tts/blob/main/_qa/v1.6-baseline.md)) and streaming text input is live (`agent-tts stream` + `say_stream` MCP tool). The remaining slate (**v1.8 → v1.10**) takes the runtime and points it at three audiences: people who want their agent to inflect, people who want to try every voice in a browser, and people who want a face on the daemon.
+**v1.6, v1.7, and v1.8 shipped on 2026-06-03** — voice cloning (baseline in [`_qa/v1.6-baseline.md`](https://github.com/biliboss/agent-tts/blob/main/_qa/v1.6-baseline.md)), streaming text input (`agent-tts stream` + `say_stream` MCP tool), SSML prosody (`<emphasis>` / `<break>` / `<prosody>` / `<say-as>`). Remaining slate (**v1.9, v1.10**) points at two audiences: people who want to try every voice in a browser, and people who want a face on the daemon.
 
 Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/agent-tts).
 
 ---
 
 <!-- v1.6 voice cloning + v1.7 streaming text input shipped 2026-06-03; see Changelog. -->
-
----
-
-## v1.8 — SSML & prosody · *Your agent finally inflects*
-
-> Faber speaks Pt-BR cleanly, but flat. `Say` accepts `[[slnc]]` / `[[rate]]` / `[[pbas]]` cues. Piper accepts none. The agent's voice has no shape.
-
-**The problem today.** No emphasis. No emotion. No deliberate pauses on punchlines. Every sentence has the same energy curve.
-
-**What ships.**
-- W3C [SSML 1.1](https://www.w3.org/TR/speech-synthesis11/) subset support: `<emphasis>`, `<break>`, `<prosody rate pitch volume>`, `<say-as interpret-as="...">`
-- For Piper Faber: the preprocessor mutates phoneme sequences before synth (slow zone vs fast zone via length-scale tweaks in the ONNX session)
-- For `say`: SSML transpiles to the native `[[...]]` directives, no behaviour change for users
-- New MCP tool argument `ssml: true` so agents can send marked-up text directly
-- Bench measures: *time from `<emphasis>` markup to audible prosody change* on warm Faber
-
-**Why now.** Long-form agents (interviews, narrations, demos) need pacing to land. Pt-BR especially — flat delivery sinks the listener's attention faster than in English.
-
-**Who cares.**
-- Studios producing AI narration / podcasts.
-- Educational tools where pacing affects comprehension.
-- Anyone building a voice agent that should sound less robotic than the *current* state-of-the-art.
 
 ---
 

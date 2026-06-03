@@ -9,6 +9,45 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.8 — SSML & prosody · 2026-06-03
+
+**Shipped**:
+
+- `src/ssml.zig` (new, 480 LOC) — streaming W3C SSML 1.1 subset parser. Supports `<emphasis level=…>`, `<break time=… strength=…/>`, `<prosody rate=… pitch=… volume=…>`, `<say-as interpret-as=…>`. Unknown tags pass through as text; malformed XML degrades gracefully — never errors
+- `src/ssml.zig` — `transpileToSay(arena, tokens)` emits the `[[slnc N]]` / `[[rate WPM]]` / `[[pbas N]]` / `[[volm X]]` / `[[rset]]` / `[[char LTRL|NORM]]` directive sequence macOS `say` understands
+- `src/piper.zig` — `synthToSamplesScaled(arena, text, length_scale)` exposes libpiper's per-call `length_scale`. `MultiPiperEngine.synthLangSSML(arena, tokens, route)` walks tokens, flushes on each `<break>` / `<prosody>` boundary, inserts zero-PCM silence per `<break time>`. `<emphasis>` / `<say-as>` collapse to plain text on Piper (honest gap)
+- `src/ipc.zig` — `Message.ssml: bool` + 7-field `ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<ssml>\t<text>`. Backward-compat parsing: peek after `<rate>`, only `"0"`/`"1"` byte triggers v1.8 path
+- `src/queue.zig` — schema gains `ssml INTEGER NOT NULL DEFAULT 0`; idempotent ALTER migration
+- `src/preproc.zig` — `processSayWithSsml` parses + transpiles, `processSsmlStripped` strips for non-SSML engines
+- `src/tts.zig` — `spawnSayMaybeSsml` wraps `spawnSay`; macOS routes SSML, Linux/Windows strips
+- `src/daemon.zig` — `runPiperSsml` non-streaming SSML+piper path
+- `src/client.zig` — `--ssml` flag + `enqueueLineSsml` helper
+- `src/mcp.zig` — `say` tool gains optional `ssml: boolean`
+- VERSION 1.8.0; new `run_ssml_tests` test step
+
+**Measurements** (Mac Air M4, ReleaseFast, 100k iters):
+
+| SSML input | Length | Parse latency / call |
+|---|---|---|
+| `"Olá mundo"` (no tags) | 10 chars | ~0.01 µs |
+| `<emphasis>` + text | 46 chars | ~0.03 µs |
+| `<prosody><break/></prosody>` | 63 chars | ~0.06 µs |
+| Long message with 4 mixed tags | 262 chars | ~0.18 µs |
+
+Parse cost below 0.2 µs even for 280-char message — three orders of magnitude under cardinal stage. TTFA budget unaffected.
+
+**Tests**: 16 new SSML + 5 new IPC = +21. `zig build test` green.
+
+**Honest scope**:
+- Piper `<emphasis>` and `<say-as>` are no-ops (no ONNX knob).
+- SSML messages skip v1.2 streaming pipeline (scopes may cross sentence boundaries).
+- `length_scale` resets each fragment; depth-1 stack for nested `<prosody>`.
+- Pre-v1.8 DBs auto-migrate on first boot.
+
+**Lead time**: see `_qa/v1.8-leadtime.md`. Elapsed **903 s (15m 3s)** from dispatch (2026-06-03 22:52:11 UTC).
+
+---
+
 ## v1.7 — Streaming text input · 2026-06-03
 
 **Shipped**:
