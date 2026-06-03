@@ -9,6 +9,25 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.6 → v1.10 fan-out summary · 2026-06-03
+
+Parent dispatch fanned out **5 parallel sub-agents** in git worktrees off `main` (`16696e6`), each shipped to its own branch (`agent-tts/v1.X`), gated on `zig build` + `zig build test`, merged serially into `main`.
+
+| Version | Theme | Lead time (agent wall) | Tests | Build gate |
+|---|---|---|---|---|
+| v1.6 | Voice cloning ship-it | **949 s (15m 49s)** | 67/67 | ✅ |
+| v1.7 | Streaming text input | **831 s (13m 51s)** | 166/166 | ✅ |
+| v1.8 | SSML & prosody | **903 s (15m 3s)** | green +21 (16 ssml + 5 ipc) | ✅ |
+| v1.9 | Web playground (scaffold) | **426 s (7m 6s)** | green + 4 Playwright | ✅ |
+| v1.10 | Menubar UI | **697 s (11m 37s)** | green + 13 Swift parser | ✅ |
+| **Parent wall** (dispatch → 5 merges + gates) | — | **1563 s (26m 3s)** | — | — |
+
+Parallel speedup: sum of agent walls 3806 s (~63 min) → real wall 1563 s ⇒ **2.4×**. Conflict-resolution + gate cost on merge: ~1000 s of parent time, mostly doc reconciliation.
+
+Each version's leadtime file (`_qa/v1.X-leadtime.md`) records the agent's own start_ts + commit_ts. Dispatch_ts is `1780527131` (2026-06-03 22:52:11 UTC).
+
+---
+
 ## v1.10 — Menubar UI · 2026-06-03
 
 **Shipped**:
