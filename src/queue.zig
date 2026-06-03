@@ -84,6 +84,9 @@ pub const PoppedItem = struct {
     engine: ipc.Engine,
     voice: []u8,
     rate: u32,
+    /// v1.8 — input contains W3C SSML 1.1 markup. Persisted on the row
+    /// so daemon restarts don't lose the flag while items are pending.
+    ssml: bool = false,
     text: []u8,
 };
 
@@ -97,7 +100,8 @@ const SCHEMA =
     \\  enqueued_at INTEGER NOT NULL,
     \\  started_at INTEGER,
     \\  finished_at INTEGER,
-    \\  engine TEXT NOT NULL DEFAULT 'say'
+    \\  engine TEXT NOT NULL DEFAULT 'say',
+    \\  ssml INTEGER NOT NULL DEFAULT 0
     \\);
     \\CREATE INDEX IF NOT EXISTS items_pending_idx ON items(state, id) WHERE state IN ('pending','playing');
 ;
@@ -139,6 +143,12 @@ pub const Queue = struct {
             try execSimple(q.db, "ALTER TABLE items ADD COLUMN engine TEXT NOT NULL DEFAULT 'say';");
         }
 
+        // v1.8 migration: pre-v1.8 DBs lack the `ssml` column. Same
+        // probe/ADD idempotency as the engine column above.
+        if (!try hasColumn(q.db, "items", "ssml")) {
+            try execSimple(q.db, "ALTER TABLE items ADD COLUMN ssml INTEGER NOT NULL DEFAULT 0;");
+        }
+
         // Crash recovery: any row left in 'playing' from a prior daemon run
         // belongs to a `say` that was killed by daemon death — re-queue it.
         try execSimple(q.db, "UPDATE items SET state='pending', started_at=NULL WHERE state='playing';");
@@ -156,7 +166,7 @@ pub const Queue = struct {
         try q.mu.lock(io);
         defer q.mu.unlock(io);
 
-        const sql = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine) VALUES (?,?,?,'pending',?,?);";
+        const sql = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml) VALUES (?,?,?,'pending',?,?,?);";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DbPrepare;
         defer _ = c.sqlite3_finalize(stmt);
@@ -167,6 +177,7 @@ pub const Queue = struct {
         if (c.sqlite3_bind_int(stmt, 3, @intCast(msg.rate)) != c.SQLITE_OK) return error.DbBind;
         if (c.sqlite3_bind_int64(stmt, 4, nowEpoch(io)) != c.SQLITE_OK) return error.DbBind;
         if (c.sqlite3_bind_text(stmt, 5, engine_str.ptr, @intCast(engine_str.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_int(stmt, 6, if (msg.ssml) 1 else 0) != c.SQLITE_OK) return error.DbBind;
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
 
         const id: u64 = @intCast(c.sqlite3_last_insert_rowid(q.db));
@@ -190,7 +201,7 @@ pub const Queue = struct {
 
     // Returns next pending row marked 'playing'. Must be called under `mu`.
     fn tryClaimNext(q: *Queue, io: std.Io, gpa: std.mem.Allocator) ?PoppedItem {
-        const sql_sel = "SELECT id, voice, rate, text, engine FROM items WHERE state='pending' ORDER BY id ASC LIMIT 1;";
+        const sql_sel = "SELECT id, voice, rate, text, engine, ssml FROM items WHERE state='pending' ORDER BY id ASC LIMIT 1;";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql_sel, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
@@ -216,6 +227,7 @@ pub const Queue = struct {
         };
         defer gpa.free(engine_buf);
         const engine = ipc.Engine.fromStr(engine_buf) orelse .say;
+        const ssml_flag: bool = c.sqlite3_column_int(stmt, 5) != 0;
 
         const sql_upd = "UPDATE items SET state='playing', started_at=? WHERE id=?;";
         var ustmt: ?*c.sqlite3_stmt = null;
@@ -233,7 +245,7 @@ pub const Queue = struct {
             return null;
         }
 
-        return .{ .id = id, .engine = engine, .voice = voice, .rate = rate, .text = text };
+        return .{ .id = id, .engine = engine, .voice = voice, .rate = rate, .ssml = ssml_flag, .text = text };
     }
 
     // Worker calls after `say` finishes. If row is still 'playing', mark done.

@@ -405,7 +405,7 @@ fn lookPathSimple(name: []const u8) bool {
 }
 
 fn runSay(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.PoppedItem) !void {
-    var spawned = try tts.spawnSay(sa, io, item.voice, item.rate, item.text);
+    var spawned = try tts.spawnSayMaybeSsml(sa, io, item.voice, item.rate, item.text, item.ssml);
 
     const pid = spawned.child.id orelse return error.SpawnNoPid;
     res.queue.setPlaying(io, item.id, pid);
@@ -421,6 +421,19 @@ fn runPiper(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.
     // Only compiled when libpiper is linked (-Dwith-piper=true).
     if (!build_options.enabled) unreachable;
     const engine = res.piper.?;
+
+    // v1.8 — SSML routing. Single-pass walk of the token stream: the
+    // streaming chunker can't see inside tags safely (a sentence period
+    // inside `<prosody>` would split the scope), so SSML inputs take a
+    // simpler non-streaming path. Trade-off documented in motor.md.
+    if (item.ssml) {
+        runPiperSsml(res, io, sa, item, engine) catch |e| {
+            res.queue.finishPlaying(io, item.id);
+            return e;
+        };
+        res.queue.finishPlaying(io, item.id);
+        return;
+    }
 
     // v1.1+v1.2: sentence-chunked (so long inputs stream chunk-by-chunk),
     // then per-chunk language detect (or forced via item.lang) routes Pt
@@ -459,6 +472,58 @@ fn runPiper(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.
         return e;
     };
     res.queue.finishPlaying(io, item.id);
+}
+
+// v1.8 — SSML synth path. Parses tokens, walks them in piper.synthLangSSML
+// (which honours `<prosody rate>` via length-scale + `<break>` via silent
+// frames), then plays the concatenated PCM in one go. Skips chunking
+// because `<prosody>` scopes may cross sentence boundaries.
+fn runPiperSsml(
+    res: *Resources,
+    io: std.Io,
+    sa: std.mem.Allocator,
+    item: queue_mod.PoppedItem,
+    engine: *piper_mod.MultiPiperEngine,
+) !void {
+    if (!build_options.enabled) unreachable;
+    const ssml_mod = @import("ssml.zig");
+
+    const t_parse0 = std.Io.Clock.now(.awake, io);
+    const tokens = try ssml_mod.parse(sa, item.text);
+    const t_parse1 = std.Io.Clock.now(.awake, io);
+
+    // Lang detection: scan the plain text portion of the token stream.
+    const plain = try ssml_mod.stripToPlain(sa, tokens);
+    const lang = detect.detect(sa, plain) catch detect.Lang.unknown;
+    const route: piper_mod.MultiPiperEngine.Route = switch (lang) {
+        .en => .en,
+        else => .pt,
+    };
+
+    res.queue.setPlaying(io, item.id, @intCast(std.c.getpid()));
+
+    const t_synth0 = std.Io.Clock.now(.awake, io);
+    const samples = try engine.synthLangSSML(sa, tokens, route);
+    const t_synth1 = std.Io.Clock.now(.awake, io);
+
+    const sample_rate = engine.sampleRate();
+    const t_play0 = std.Io.Clock.now(.awake, io);
+    if (res.audio_player.ready) {
+        res.audio_player.streamS16leAppend(samples, sample_rate) catch |e| {
+            std.debug.print("[worker] zaudio play failed: {s} — falling back to afplay\n", .{@errorName(e)});
+            try playViaAfplay(io, sa, samples, sample_rate);
+        };
+    } else {
+        try playViaAfplay(io, sa, samples, sample_rate);
+    }
+    const t_play1 = std.Io.Clock.now(.awake, io);
+
+    const parse_us = @as(f64, @floatFromInt(t_parse1.nanoseconds - t_parse0.nanoseconds)) / 1_000.0;
+    const synth_ms = @as(f64, @floatFromInt(t_synth1.nanoseconds - t_synth0.nanoseconds)) / 1_000_000.0;
+    const play_ms = @as(f64, @floatFromInt(t_play1.nanoseconds - t_play0.nanoseconds)) / 1_000_000.0;
+    std.debug.print("[worker] piper-ssml id={d} tokens={d} parse={d:.1}µs synth={d:.1}ms play={d:.1}ms samples={d}\n", .{
+        item.id, tokens.len, parse_us, synth_ms, play_ms, samples.len,
+    });
 }
 
 // v0.7 fast path — one synth, one play, no thread spawn. v1.1: synth via

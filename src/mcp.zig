@@ -26,7 +26,7 @@ const json = std.json;
 const ipc = @import("ipc.zig");
 const client = @import("client.zig");
 
-pub const VERSION = "1.5.0";
+pub const VERSION = "1.8.0";
 pub const PROTOCOL_VERSION = "2024-11-05";
 
 const READ_BUF = 256 * 1024; // long agent monologues hit ~8 KB after escaping
@@ -209,7 +209,7 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
 
     const text_prop = try obj(a, &.{
         .{ "type", str("string") },
-        .{ "description", str("Pt-BR text to speak. Newlines/tabs are sanitized.") },
+        .{ "description", str("Pt-BR text to speak. Newlines/tabs are sanitized. Pass SSML markup (W3C 1.1 subset) when `ssml=true`.") },
     });
     const engine_prop = try obj(a, &.{
         .{ "type", str("string") },
@@ -224,12 +224,17 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
         .{ "type", str("integer") },
         .{ "description", str("Words per minute (default 330, ignored by piper).") },
     });
+    const ssml_prop = try obj(a, &.{
+        .{ "type", str("boolean") },
+        .{ "description", str("v1.8+: treat text as W3C SSML 1.1 subset (<emphasis>, <break>, <prosody>, <say-as>). Default false.") },
+    });
 
     const props = try obj(a, &.{
         .{ "text", text_prop },
         .{ "engine", engine_prop },
         .{ "voice", voice_prop },
         .{ "rate", rate_prop },
+        .{ "ssml", ssml_prop },
     });
     const required = try arr(a, &.{str("text")});
 
@@ -325,7 +330,13 @@ fn callSay(
         rate = @intCast(r.integer);
     }
 
-    const id_str = client.enqueueLine(a, io, home, engine, voice, rate, text) catch |e| switch (e) {
+    var ssml_flag: bool = false;
+    if (ao.get("ssml")) |s| {
+        if (s != .bool) return try toolErrorResponse(a, id, "ssml must be a boolean");
+        ssml_flag = s.bool;
+    }
+
+    const id_str = client.enqueueLineSsml(a, io, home, engine, voice, rate, text, ssml_flag) catch |e| switch (e) {
         error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running — start with `agent-tts daemon` or `agent-tts daemon install`"),
         error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error"),
         error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon returned an unexpected response"),

@@ -160,3 +160,42 @@ Cost: ~340 ms additional cold boot when both voices load (~680 ms total piper in
 Install the En voice with `./scripts/fetch-voice-en.sh`. The daemon logs `en=off` and falls back to single-voice Pt synth when the file is missing — no crash, no degraded prompt. Force a single voice end-to-end with `agent-tts --lang pt|en "..."`; `auto` (the default) runs the detector per sentence.
 
 The remaining ambition — XTTS-v2-grade multilingual quality from a single ONNX checkpoint — is parked. Piper's per-voice models ship today, work offline, and stay under the disk budget. Single-checkpoint multilingual returns to the table when Coqui's ONNX export stabilizes (see [Coqui discussion #4014](https://github.com/coqui-ai/TTS/discussions/4014)) or a Piper community checkpoint matches Faber/Amy quality. Tracked in [What's next](/whats-next/).
+
+## SSML support per engine — v1.8
+
+agent-tts accepts a W3C SSML 1.1 subset on every engine. Pass `--ssml` on the CLI, or set the `ssml: true` argument on the MCP `say` tool, and the daemon parses the input via `src/ssml.zig` before dispatching. Engine support varies — honest table:
+
+| Element | macOS `say` | Piper Faber / Amy | Cloned (XTTS-v2) |
+|---|---|---|---|
+| `<emphasis level=…>` | volume bump + micro-pause via `[[volm]]` + `[[slnc 80]]` | no-op (no ONNX knob) | future — sidecar passes through |
+| `<break time=… strength=…>` | `[[slnc <ms>]]` directive | zero-PCM silence frames at native rate | future |
+| `<prosody rate=…>` | `[[rate <wpm>]]` (`330 × rate`) | libpiper `length_scale = 1 / rate` per call | future |
+| `<prosody pitch=±st>` | `[[pbas <n>]]` (`47 + 3·semitones`) | no-op | future |
+| `<prosody volume=…>` | `[[volm <0..2>]]` | no-op (handled in audio mixer if needed) | future |
+| `<say-as interpret-as=characters>` | `[[char LTRL]] … [[char NORM]]` | no-op | future |
+| Unknown / `<speak>` envelope | passes through as text | passes through as text | passes through as text |
+
+What this buys you:
+
+- **macOS `say` agents inflect today.** Drop a `<prosody rate="slow">` around the punchline; the agent slows down naturally without the `[[…]]` syntax your prompts would otherwise need
+- **Piper agents pace.** Length-scale lets Faber/Amy speak slower or faster per scope — useful for narration / educational content. Pitch and emphasis remain Piper gaps until a future model adds the knobs
+- **Pure text remains the fast path.** Without `--ssml`, the v0.5 preprocessor still expands cardinals + abbreviations and inserts `[[slnc]]` pauses on punctuation. v1.8 is purely additive
+
+SSML on Piper takes the single-pass synth path (not the v1.2 streaming chunker) because `<prosody>` scopes may cross sentence boundaries. Long SSML inputs trade ~50 ms first-audio improvement for correctness; plain-text inputs keep the streaming win. Parser cost is **below 0.2 µs for a 280-char message** — TTFA budget unchanged.
+
+Example:
+
+```bash
+# Slow opening with an emphatic close
+agent-tts --ssml \
+  '<prosody rate="slow">Atenção,</prosody> a entrega <emphasis level="strong">acabou</emphasis>.<break time="500ms"/> Próximos passos.'
+```
+
+The same string sent via MCP:
+
+```json
+{"name":"say","arguments":{
+  "text":"<prosody rate=\"slow\">Atenção,</prosody> a entrega <emphasis level=\"strong\">acabou</emphasis>.<break time=\"500ms\"/> Próximos passos.",
+  "ssml":true
+}}
+```

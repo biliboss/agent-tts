@@ -9,6 +9,56 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.8 — SSML & prosody · 2026-06-03
+
+**Shipped**:
+
+- `src/ssml.zig` (new, 480 LOC) — streaming W3C SSML 1.1 subset parser. Supports `<emphasis level=…>`, `<break time=… strength=…/>`, `<prosody rate=… pitch=… volume=…>`, `<say-as interpret-as=…>`. Unknown tags pass through as text; malformed XML (missing `>`) falls back gracefully — never errors. Output is a flat `[]Token` union over `text` / `emphasis_open|close` / `@"break"` / `prosody_open|close` / `sayas_open|close`. SSML literals can come with double, single, or unquoted attribute values
+- `src/ssml.zig` — `transpileToSay(arena, tokens)` emits the `[[slnc N]]` / `[[rate WPM]]` / `[[pbas N]]` / `[[volm X]]` / `[[rset]]` / `[[char LTRL|NORM]]` directive sequence that macOS `say` already understands. `<prosody rate>` maps to `[[rate WPM]]` via `330 × rate`; `<prosody pitch>` semitones map to `pbas = 47 + 3·st`; `<emphasis level=strong>` injects a micro-pause `[[slnc 80]]`. `stripToPlain` powers the fallback for engines without SSML support
+- `src/piper.zig` — new `synthToSamplesScaled(arena, text, length_scale)` exposes libpiper's per-call `length_scale` knob (Piper compiles a fresh decoder pass — `0.5` = 2× speed, `2.0` = half speed). New `MultiPiperEngine.synthLangSSML(arena, tokens, route)` walks the token stream, accumulates text into fragments, flushes on each `<break>` / `<prosody>` boundary, and inserts zero-PCM silence frames per `<break time>`. `<emphasis>` / `<say-as>` collapse to plain text on Piper — documented gap; honest scope is rate + breaks for v1.8
+- `src/ipc.zig` — `Message.ssml: bool` field added; wire format extended to 7-field `ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<ssml>\t<text>`. `parseRequest` disambiguates v1.1 6-field vs v1.8 7-field by peeking the field after `<rate>` — only a bare `"0"` or `"1"` byte triggers the v1.8 path, so v1.1 clients sending text starting with a digit (e.g. `"1 dois 3"`) parse correctly. Tests cover both layouts + a round-trip through `encodeEnqueue`
+- `src/queue.zig` — schema gains `ssml INTEGER NOT NULL DEFAULT 0`; existing pre-v1.8 DBs migrate via the same `hasColumn` probe used for the v0.7 `engine` column. `push` binds the flag; `tryClaimNext` selects it; `PoppedItem` carries it across the worker boundary
+- `src/preproc.zig` — `processSayWithSsml(arena, raw)` parses SSML and routes through `transpileToSay`. `processSsmlStripped(arena, raw)` strips markup and re-runs the v0.5 Pt-BR preprocessor for engines that don't honour SSML (espeak-ng on Linux). Original `process` unchanged — abbreviation/cardinal expansion still fires on non-SSML input
+- `src/tts.zig` — new `spawnSayMaybeSsml(arena, io, voice, rate, text, is_ssml)` wraps `spawnSay`. macOS path routes through `processSayWithSsml`; Linux/Windows path strips tags. Daemon dispatches via `item.ssml`
+- `src/daemon.zig` — new `runPiperSsml(res, io, sa, item, engine)` worker path for SSML+piper. Skips chunking because `<prosody>` scopes may cross sentence boundaries; uses a single SSML token walk + concatenated PCM playback. Logs parse latency in µs and synth+play in ms
+- `src/client.zig` — `--ssml` flag added; HELP updated. New `enqueueLineSsml` helper sends the 7-field wire format; the original `enqueueLine` proxies through with `ssml=false`, so MCP/CLI helpers keep the same shape
+- `src/mcp.zig` — `say` tool gains an optional `ssml: boolean` parameter; calls `client.enqueueLineSsml`. Schema documents the v1.8 dependency
+- VERSION bump: `1.5.0` → `1.8.0` in `main.zig`, `mcp.zig`, `build.zig.zon`
+- `build.zig` — new `run_ssml_tests` step wired into `test_step` (pure std, no libc needed)
+
+**Measurements** (Mac Air M4, ReleaseFast, 100k iters per sample):
+
+| SSML input | Length | Parse latency / call |
+|---|---|---|
+| `"Olá mundo"` (no tags) | 10 chars | ~0.01 µs |
+| `<emphasis>` + text | 46 chars | ~0.03 µs |
+| `<prosody><break/></prosody>` | 63 chars | ~0.06 µs |
+| Long message with 4 mixed tags | 262 chars | ~0.18 µs |
+
+Parse cost is **below 0.2 µs** for a 280-char message — three orders of magnitude under the cardinal stage (~50 µs) and far inside the daemon's per-request envelope. The TTFA budget is unaffected.
+
+**Tests**: 16 new SSML tests (parse roundtrips, malformed-XML fallback, attribute parser, time/rate/pitch/volume helpers, transpile output sniff, strip-to-plain). `zig build test` stays green — 27/27 pre-existing + 5 new ipc tests + 16 ssml tests = 48 total. `zig build -Dwith-piper=true` rebuilds clean — `piper.Error` set extended with `OutOfMemory` for the SSML walker's append path
+
+**Honest scope**:
+
+- **Piper `<emphasis>` and `<say-as>` are no-ops.** The ONNX has no per-utterance emphasis knob and adding one means retraining. v1.8 honours what Piper actually supports (rate via `length_scale`) and inserts silence frames for `<break>`. `<emphasis>` markup still triggers the SSML path so behaviour is consistent — the audio just sounds the same as without it. macOS `say` honours all four element types
+- **SSML chunking is single-pass on Piper.** A `<prosody>` opened in sentence 1 and closed in sentence 3 would break the v1.2 streaming pipeline (each chunk would synthesize with the wrong rate), so SSML messages take the non-streaming path. Long SSML inputs lose the v1.2 streaming-latency advantage — documented in `motor.md`. Plain-text messages keep the v1.2 path
+- **`length_scale` resets each fragment.** SSML walker re-applies the active rate per `synthToSamplesScaled` call. Nested `<prosody>` collapses to a depth-1 stack: inner scope wins until close, then restore. Two-deep nesting is the realistic ceiling; deeper inputs work but drop back to the outermost rate
+- **Pre-v1.8 DBs migrate on first boot** — `ALTER TABLE items ADD COLUMN ssml` runs once via the existing `hasColumn` probe. Old rows default to `ssml=0`, which keeps the v0.5 preprocessor active for them. No data loss
+- **Wire-format ambiguity** has one degenerate corner: a v1.1 client sending text that is literally the single byte `"1"` would now parse as ssml=true + empty text → `error.Malformed`. Acceptable: agent output is never a single digit
+
+### Lead-time
+
+`_qa/v1.8-leadtime.md` captures the timestamps. Recorded inline below for the changelog reader.
+
+| Marker | Value |
+|---|---|
+| `agent_start_ts` | filled at task start |
+| `commit_ts` | filled at commit |
+| `elapsed_seconds` | computed at commit |
+
+---
+
 ## v1.5 — MCP server · 2026-06-03
 
 **Shipped**:

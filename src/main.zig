@@ -26,6 +26,8 @@
 // v1.3: cross-platform — Linux espeak-ng + systemd, Windows best-effort.
 // v1.4: `voice clone` + `voice list` subcommands; XTTS-v2 Python sidecar.
 // v1.5: stdio JSON-RPC MCP server (`agent-tts mcp`) for Claude Code / Cursor / Cline.
+// v1.8: W3C SSML 1.1 subset (`<emphasis>`/`<break>`/`<prosody>`/`<say-as>`) for
+//       say (transpiled to `[[…]]` directives) and piper (length-scale + silence).
 //
 // KPI = time-to-first-audio (TTFA).
 
@@ -42,7 +44,7 @@ const voice = @import("voice.zig");
 const mcp = @import("mcp.zig");
 const build_options = @import("build_options");
 
-pub const VERSION = "1.5.0";
+pub const VERSION = "1.8.0";
 
 const HELP =
     \\agent-tts v{s} — multilingual TTS via system voice or libpiper

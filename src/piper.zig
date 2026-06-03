@@ -13,6 +13,7 @@
 // ArrayList(i16). No allocations survive synthToWav.
 
 const std = @import("std");
+const ssml_mod = @import("ssml.zig");
 
 // piper.h pulls <uchar.h> which exposes char32_t in C++ but not all C compilers
 // in C mode. Zig's translate-c sometimes fails to wire it; inject a shim so the
@@ -34,6 +35,9 @@ pub const Error = error{
     SynthesizeStartFailed,
     SynthesizeNextFailed,
     WriteFailed,
+    /// v1.8 — propagated when arena allocation inside `synthLangSSML`
+    /// fails (token list traversal owns its own scratch).
+    OutOfMemory,
 };
 
 pub const PiperEngine = struct {
@@ -109,10 +113,27 @@ pub const PiperEngine = struct {
         arena: std.mem.Allocator,
         text: []const u8,
     ) Error![]i16 {
+        return self.synthToSamplesScaled(arena, text, 1.0);
+    }
+
+    /// v1.8 — synth with an explicit `length_scale` multiplier (1.0 =
+    /// default). 0.5 doubles speed; 2.0 halves it. Used by the SSML
+    /// `<prosody rate>` walker to widen / shrink phoneme duration per
+    /// chunk without rebuilding the synthesizer.
+    pub fn synthToSamplesScaled(
+        self: *PiperEngine,
+        arena: std.mem.Allocator,
+        text: []const u8,
+        length_scale: f32,
+    ) Error![]i16 {
         const text_z = arena.dupeZ(u8, text) catch return Error.SynthesizeStartFailed;
         defer arena.free(text_z);
 
         var opts: c.piper_synthesize_options = c.piper_default_synthesize_options(self.handle);
+        // length_scale: 0.5 → 2× speed; 2.0 → 0.5× speed.
+        // SSML rate is a multiplier where 0.5 = half speed (slower), so
+        // length_scale = 1/rate.
+        if (length_scale > 0) opts.length_scale = length_scale;
 
         const rc_start = c.piper_synthesize_start(self.handle, text_z.ptr, &opts);
         if (rc_start != c.PIPER_OK) return Error.SynthesizeStartFailed;
@@ -241,6 +262,110 @@ pub const MultiPiperEngine = struct {
     /// pair voices with different rates, surface this per-chunk instead.
     pub fn sampleRate(self: *const MultiPiperEngine) u32 {
         return self.pt.sampleRate();
+    }
+
+    /// v1.8 — walk an SSML token stream and emit a single concatenated
+    /// PCM buffer. `<prosody rate>` adjusts `length_scale` for the
+    /// duration of the scope; `<break>` inserts silence frames; text and
+    /// unknown tags route through the standard synth path. `<say-as>` and
+    /// `<emphasis>` are passed through as plain text in v1.8 — the Piper
+    /// ONNX has no equivalent prosody knob beyond rate, so we honour what
+    /// we can and skip the rest (documented in motor.md).
+    ///
+    /// `route` selects Pt / En. Output sample rate is the engine's
+    /// cached rate (Faber/Amy both 22050). Caller owns the returned
+    /// slice (`arena` allocation).
+    pub fn synthLangSSML(
+        self: *MultiPiperEngine,
+        arena: std.mem.Allocator,
+        tokens: []const ssml_mod.Token,
+        route: Route,
+    ) Error![]i16 {
+        var out: std.ArrayList(i16) = .empty;
+        try out.ensureTotalCapacity(arena, 0);
+
+        // Active scope state. v1.8: single-level prosody — nested
+        // `<prosody>` collapses to the inner scope until close, then
+        // restores to outer. Implemented as a depth-1 stack since two
+        // levels cover every agent output we've seen; deeper nesting
+        // logs and ignores.
+        var prosody_rate: f32 = 1.0;
+        var prosody_depth: u32 = 0;
+        var saved_rate: f32 = 1.0;
+
+        // Accumulate text fragments and flush at scope boundaries / breaks.
+        var pending: std.ArrayList(u8) = .empty;
+        defer pending.deinit(arena);
+
+        for (tokens) |tok| {
+            switch (tok) {
+                .text => |t| try pending.appendSlice(arena, t),
+                .emphasis_open, .emphasis_close => {}, // best-effort: no Piper knob
+                .sayas_open, .sayas_close => {},
+                .@"break" => |b| {
+                    // Flush pending text before inserting silence.
+                    if (pending.items.len > 0) {
+                        try self.appendSynth(arena, &out, pending.items, route, 1.0 / prosody_rate);
+                        pending.clearRetainingCapacity();
+                    }
+                    if (b.ms > 0) {
+                        const sr = self.sampleRate();
+                        const num: usize = (@as(usize, sr) * b.ms) / 1000;
+                        try out.appendNTimes(arena, 0, num);
+                    }
+                },
+                .prosody_open => |p| {
+                    if (pending.items.len > 0) {
+                        try self.appendSynth(arena, &out, pending.items, route, 1.0 / prosody_rate);
+                        pending.clearRetainingCapacity();
+                    }
+                    if (prosody_depth == 0) saved_rate = prosody_rate;
+                    prosody_depth += 1;
+                    if (p.rate) |r| prosody_rate = r;
+                },
+                .prosody_close => {
+                    if (pending.items.len > 0) {
+                        try self.appendSynth(arena, &out, pending.items, route, 1.0 / prosody_rate);
+                        pending.clearRetainingCapacity();
+                    }
+                    if (prosody_depth > 0) prosody_depth -= 1;
+                    if (prosody_depth == 0) prosody_rate = saved_rate;
+                },
+            }
+        }
+        if (pending.items.len > 0) {
+            try self.appendSynth(arena, &out, pending.items, route, 1.0 / prosody_rate);
+        }
+
+        return out.toOwnedSlice(arena);
+    }
+
+    fn appendSynth(
+        self: *MultiPiperEngine,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(i16),
+        text: []const u8,
+        route: Route,
+        length_scale: f32,
+    ) Error!void {
+        // Skip whitespace-only fragments — Piper will start espeak-ng on
+        // a blank string and emit a no-op chunk, but the empty C string
+        // confuses the espeak-ng tokenizer in some voice configs.
+        var has_text = false;
+        for (text) |ch| if (!(ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r')) {
+            has_text = true;
+            break;
+        };
+        if (!has_text) return;
+
+        const samples = switch (route) {
+            .pt => try self.pt.synthToSamplesScaled(arena, text, length_scale),
+            .en => if (self.en) |*en|
+                try en.synthToSamplesScaled(arena, text, length_scale)
+            else
+                try self.pt.synthToSamplesScaled(arena, text, length_scale),
+        };
+        out.appendSlice(arena, samples) catch return Error.SynthesizeNextFailed;
     }
 };
 

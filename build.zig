@@ -368,6 +368,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_ipc_tests = b.addRunArtifact(ipc_tests);
 
+    // v1.8 — SSML 1.1 subset parser + per-engine transpile. Pure std, no
+    // external deps. Tests cover parse roundtrips, malformed-XML
+    // graceful fallback, and the `say` [[…]] directive emitter.
+    const ssml_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ssml.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_ssml_tests = b.addRunArtifact(ssml_tests);
+
     // Benchmark executable for the preprocessor (used to populate
     // _qa/v0.5-baseline.md). Build in ReleaseFast for realistic numbers.
     const preproc_mod = b.createModule(.{
@@ -415,4 +427,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_detect_tests.step);
     test_step.dependOn(&run_voice_tests.step);
     test_step.dependOn(&run_ipc_tests.step);
+    test_step.dependOn(&run_ssml_tests.step);
 }
