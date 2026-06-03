@@ -30,9 +30,10 @@ const daemon = @import("daemon.zig");
 const launchd = @import("launchd.zig");
 const ipc = @import("ipc.zig");
 const audio = @import("audio.zig");
+const voice = @import("voice.zig");
 const build_options = @import("build_options");
 
-pub const VERSION = "1.0.0";
+pub const VERSION = "1.4.0";
 
 const HELP =
     \\agent-tts v{s} — Pt-BR TTS via macOS `say` or libpiper
@@ -47,7 +48,11 @@ const HELP =
     \\  agent-tts daemon install         install launchd LaunchAgent (auto-start)
     \\  agent-tts daemon uninstall       remove launchd LaunchAgent
     \\  agent-tts daemon status          print launchd load state
+    \\  agent-tts voice clone            clone a voice from a 20-120s WAV (v1.4+)
+    \\    --sample <wav> --name <slug>
+    \\  agent-tts voice list             list installed voices (faber + cloned)
     \\  agent-tts --voice "Felipe" "texto"
+    \\  agent-tts --voice gabriel "..."  use a cloned voice (v1.4+)
     \\  agent-tts --rate 220 "texto"
     \\
     \\Piper backend (v0.7+):
@@ -105,6 +110,9 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, cmd, "ttfa-bench")) {
             return runTtfaBench(arena, io, home, args);
+        }
+        if (std.mem.eql(u8, cmd, "voice")) {
+            return voice.run(arena, io, home, args);
         }
         if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
             std.debug.print(HELP, .{VERSION});
@@ -224,6 +232,13 @@ fn runTtfaBench(
     switch (engine) {
         .say => try benchSay(arena, io, warm, text),
         .piper => try benchPiper(arena, io, home, warm, text),
+        .cloned => {
+            std.debug.print(
+                "[ttfa-bench] engine=cloned not benchable from this path (sidecar startup dominates). " ++
+                    "Use `agent-tts --voice <slug> '...'` against a running daemon to measure end-to-end.\n",
+                .{},
+            );
+        },
     }
 }
 

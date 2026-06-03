@@ -29,10 +29,12 @@ pub const Op = enum { enqueue, queue, skip, clear };
 pub const Engine = enum {
     say,
     piper,
+    cloned,
 
     pub fn fromStr(s: []const u8) ?Engine {
         if (std.mem.eql(u8, s, "say")) return .say;
         if (std.mem.eql(u8, s, "piper")) return .piper;
+        if (std.mem.eql(u8, s, "cloned")) return .cloned;
         return null;
     }
 
@@ -172,6 +174,15 @@ test "encodeEnqueue round-trips through parseRequest" {
 test "Engine.fromStr accepts known engines only" {
     try std.testing.expectEqual(Engine.say, Engine.fromStr("say").?);
     try std.testing.expectEqual(Engine.piper, Engine.fromStr("piper").?);
+    try std.testing.expectEqual(Engine.cloned, Engine.fromStr("cloned").?);
     try std.testing.expect(Engine.fromStr("Luciana") == null);
     try std.testing.expect(Engine.fromStr("xtts") == null);
+}
+
+test "parseRequest new 5-field ENQUEUE with cloned engine" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(arena.allocator(), "ENQUEUE\tcloned\tgabriel\t330\tOlá");
+    try std.testing.expectEqual(Engine.cloned, req.enqueue.engine);
+    try std.testing.expectEqualStrings("gabriel", req.enqueue.voice);
 }

@@ -23,6 +23,7 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v0.6** | libpiper FFI baseline | piper init 400 ms, synth + WAV 100 ms warm | 2026-06-03 |
 | **v0.7** | zaudio streaming + `--engine say\|piper` routing | piper synth warm **91 ms** | 2026-06-03 |
 | **v1.0** | Universal binary + brew formula + GitHub Pages docs | universal 1.8 MB, host 918 KB | 2026-06-03 |
+| **v1.4** | `voice clone` + `voice list` + XTTS-v2 Python sidecar | surface + dispatch + 40/40 tests; install/smoke deferred to v1.4.1 | 2026-06-03 |
 
 ## KPI delivered
 
@@ -72,7 +73,6 @@ See [What's next](/whats-next/) for the marketing roadmap. Short version:
 | v1.1 | Multilingual | Speak your stack — code-switch Pt + En cleanly |
 | v1.2 | Streaming | First word before the last is written |
 | v1.3 | Cross-platform | agent-tts on Linux (and Windows when you ask) |
-| v1.4 | Voice cloning | Your voice, your agent |
 | v1.5 | MCP server | Native Claude Code voice — drop the shell-out |
 
 ## Locked nots

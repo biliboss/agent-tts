@@ -49,6 +49,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []const
 
 fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
     var engine: ipc.Engine = .piper;
+    var engine_explicit = false;
     var voice_arg: ?[]const u8 = null;
     var rate: u32 = DEFAULT_RATE;
     var text: ?[]const u8 = null;
@@ -63,9 +64,10 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
                 std.process.exit(2);
             }
             engine = ipc.Engine.fromStr(args[i]) orelse {
-                std.debug.print("error: --engine invalid (got '{s}') — expected say|piper\n", .{args[i]});
+                std.debug.print("error: --engine invalid (got '{s}') — expected say|piper|cloned\n", .{args[i]});
                 std.process.exit(2);
             };
+            engine_explicit = true;
         } else if (std.mem.eql(u8, a, "--voice")) {
             i += 1;
             if (i >= args.len) {
@@ -99,7 +101,19 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     const voice: []const u8 = voice_arg orelse switch (engine) {
         .say => DEFAULT_VOICE,
         .piper => "faber",
+        // No default slug for cloned — daemon will route by directory match.
+        // Without a voice flag, user gets a hard error from the daemon's
+        // missing-embedding fallback rather than a silent misroute.
+        .cloned => "",
     };
+
+    // Implicit routing: if user passed `--voice <slug>` without an explicit
+    // `--engine`, peek the slug to decide. faber → piper, Luciana/known say
+    // voices keep the current default, anything else with a matching dir
+    // under ~/.cache/agent-tts/voices/<slug>/ routes to cloned.
+    if (!engine_explicit and voice_arg != null) {
+        engine = resolveEngineFromVoice(arena, io, home, voice_arg.?);
+    }
 
     const clean = try ipc.sanitizeText(arena, text.?);
     const msg = ipc.Message{ .engine = engine, .voice = voice, .rate = rate, .text = clean };
@@ -245,6 +259,30 @@ fn simpleOp(arena: std.mem.Allocator, io: std.Io, home: []const u8, cmd: []const
         std.process.exit(1);
     }
     return try arena.dupe(u8, line);
+}
+
+// v1.4 — when `--voice <slug>` is given without `--engine`, decide which engine
+// the daemon should route to:
+//   - "faber"                             → piper (the bundled neural voice)
+//   - <slug> with metadata.json on disk   → cloned (XTTS-v2 sidecar)
+//   - everything else                     → say (existing macOS path)
+// Daemon revalidates on its side, so a missed lookup here just falls back
+// rather than crashing.
+fn resolveEngineFromVoice(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    voice: []const u8,
+) ipc.Engine {
+    if (std.mem.eql(u8, voice, "faber")) return .piper;
+    const meta_path = std.fmt.allocPrint(
+        arena,
+        "{s}/.cache/agent-tts/voices/{s}/metadata.json",
+        .{ home, voice },
+    ) catch return .say;
+    var f = std.Io.Dir.cwd().openFile(io, meta_path, .{}) catch return .say;
+    f.close(io);
+    return .cloned;
 }
 
 fn openSocket(arena: std.mem.Allocator, io: std.Io, home: []const u8) !std.Io.net.Stream {

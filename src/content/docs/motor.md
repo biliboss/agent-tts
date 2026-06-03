@@ -101,6 +101,41 @@ agent-tts --rate 220 "Mais rápido."             # WPM (say only — piper ignor
 
 Persistent config in `~/.config/agent-tts/config.json` planned for v1.1.
 
+## Cloned voices (v1.4)
+
+v1.4 adds a **third engine**: `cloned`. Selected automatically when `--voice <slug>` resolves to a directory under `~/.cache/agent-tts/voices/<slug>/` produced by `agent-tts voice clone`.
+
+```bash
+agent-tts voice clone --sample me-reading.wav --name gabriel
+agent-tts --voice gabriel "Deploy concluído."
+```
+
+**The cloned engine is not pure Zig.** Coqui XTTS-v2 (the only credible local Pt-BR cloner) is a 2 GB PyTorch model with no production-stable ONNX export today. Reimplementing XTTS in Zig is not on the table — and embedding the model in a Zig binary breaks the SSD goal anyway.
+
+So v1.4 **relaxes the "only Zig" lifecycle constraint, but only for the cloned engine**. Faber + say still work without Python:
+
+| Engine | Runtime | Python required? |
+|---|---|---|
+| `say` (Luciana) | macOS system | no |
+| `piper` (Faber) | libpiper FFI (Zig binary) | no |
+| `cloned` (custom) | Python sidecar via `std.process.Child` | **yes** |
+
+**Process line is the licensing wall.** Coqui TTS is MPL-2.0. The sidecar runs as a separate process spawned from `daemon.zig::synthClonedViaSidecar`. The parent Zig binary stays dual MIT/Apache — no MPL code is linked or distributed inside `agent-tts`.
+
+**Sidecar protocol** (kept boring):
+
+```
+voice_synth.py --embedding <path.npz> --rate 22050 [--lang pt]
+  ← text on stdin
+  → raw s16le mono PCM on stdout at the requested rate
+```
+
+The daemon drains stdout into a buffer, feeds it to the same `AudioPlayer.streamS16le` path Faber uses. Fallback chain on sidecar failure: piper Faber when loaded, else `say` Luciana.
+
+**Why this isn't the default.** Cold startup of XTTS-v2 on Apple Silicon CPU is ~6-10s and warm first-sample is ~500-900ms — pessimistic vs Faber's 91ms. Cloned is opt-in for personal voice, not the snappy default.
+
+See [Changelog v1.4](/changelog/#v14--voice-cloning--2026-06-03) for the install + measurement story.
+
 ## Open gap: code-switching EN
 
 `GitHub Actions` is pronounced as Portuguese phonemes today by both Piper Faber and `say`. This is the headline driver for v1.1 — see [What's next](/whats-next/).
