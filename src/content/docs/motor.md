@@ -1,75 +1,82 @@
 ---
 title: TTS engine
-description: Pt-BR engine comparison and why `say` Premium Luciana wins in v1.0.
+description: Piper Faber wins as the v1.0 default. macOS say Luciana is the offline-always fallback. Comparison + decision history.
 ---
 
 ## TL;DR
 
-**v1.0** pick: `say` Luciana wins — TTFA + size + native Neural Engine. The decision is revisited in **v1.1+** because agents speak Pt-BR with English terms ("GitHub Actions", "Coolify deploy") and monolingual `say` mispronounces them.
+**v1.0 default**: **libpiper Faber** (neural, Pt-BR). Warm synth ~91 ms, cold engine load ~400 ms paid once at daemon boot. Single-binary, no Python.
 
-**v1.1+ plan**: multilingual engine via Python sidecar. **XTTS-v2** (Coqui) picked for native Pt+En code-switching plus top neural quality. Costs ~3GB on disk and needs a Python sidecar (the model must stay resident). Decision made 2026-06-03 after benchmarking Piper Faber (Pt-only, failed on EN) and XTTS-v2 CLI (top quality but 27s/call from the CLI due to model reload).
+**Fallback**: macOS `say -v Luciana`. Works even when piper is not built in. Selected with `--engine say`.
 
-## Comparison
+Both are offline, both are free, both ship in the same Zig binary.
 
-Primary criterion is **time-to-first-audio**. Secondary criterion is disk size (Mac Air M4 with a small SSD).
+| | Piper Faber (default) | macOS `say` (fallback) |
+|---|---|---|
+| Engine type | Neural (ONNX) | Concatenative + ANE |
+| Pt-BR quality | Top neural | Solid system voice |
+| Warm synth | **~91 ms** | spawn 0.8 ms + playback |
+| Cold engine load | ~400 ms once at daemon boot | 0 |
+| Disk extra | 63 MB voice ONNX + ~34 MB dylibs | 0 (system) |
+| Binary delta | +2 KB Zig + dylib payload | 0 |
+| Code-switch EN | Mispronounces ("GitHub Actions") | Mispronounces |
+| License | GPL-3.0 inherits when linked | Free (system) |
 
-| Engine | Extra size | Typical TTFA | Pt-BR quality | Cost | Offline |
-|-------|---------------|-------------|------------------|-------|---------|
-| **macOS `say` Premium** | 0 in the binary, ~200MB system-side (Premium voice) | **< 200ms** warm | Good (Luciana/Felipe Premium) | Free | Yes |
-| Piper (`pt_BR-faber-medium`) | ~63MB voice + ~10MB runtime | ~100ms | OK, robotic | Free (MIT) | Yes |
-| Kokoro | ~80MB | ~200ms | Pt-BR limited, EN fallback | Free (Apache) | Yes |
-| Coqui XTTS-v2 | ~2GB+ | ~500ms-1s first sentence | Excellent, cloneable | Free | Yes |
-| ElevenLabs | 0 local | 200-800ms + network RTT | Excellent | Paid + network | No |
+Both engines mispronounce English terms today — that is the headline gap addressed in v1.1.
 
-## Benchmark 2026-06-03 + v1.1+ decision
+## Decision history
 
-Driver for the review: agents speak Pt-BR with English terms ("GitHub Actions", "Coolify deploy") and monolingual `say` mispronounces them. Tested: Piper Faber (Pt-only, Python via uvx) and multilingual XTTS-v2.
+Before v0.6 the plan called for `say` Luciana as the v1.0 default and an optional Coqui XTTS-v2 Python sidecar for the neural path. That plan was rejected on 2026-06-03 for two reasons:
 
-| Engine | Footprint | Real TTFA (agent UX) | Code-switch | Verdict |
-|--------|-----------|----------------------|-------------|----------|
-| say Luciana | 0 | ~50ms (warm daemon) | bad | keep in v1.0 |
-| Piper Faber via uvx | 250MB | ~650ms | bad | rejected (Pt-only + python dep) |
-| XTTS-v2 CLI Python | 3GB | 27s/call (Python reload) | good | rejected (CLI unviable, Python sidecar blocked by "only Zig") |
+- **Pt-only Piper Faber** failed code-switch (rejected).
+- **XTTS-v2 via Python sidecar** worked but violated the "only Zig" lifecycle constraint.
 
-Disk before: 8.4GB free. XTTS reserved 3GB. Cleanup after the decision freed it all.
+The accepted alternative landed in v0.6: link **libpiper** from [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl) via `@cImport piper.h`. That made Piper Faber a single-binary engine — no Python, no sidecar. v0.7 then made it the default, swapping `say` to the fallback slot.
 
-### v1.1+ plan locked: **libpiper FFI**
+## Comparison vs alternatives
 
-Self-imposed constraint: **only Zig** owns the lifecycle. No Python sidecar. Survey of Zig OSS (Ghostty, zml, matklad notes, zaudio):
+Primary criterion is **time-to-first-audio** (TTFA). Secondary criterion is disk size (Mac Air M4 with a small SSD).
 
-- **libpiper** (from [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl), 4.3k★, GPL) — the only clean, maintained C API with a Pt-BR voice. Built via CMake, which pulls onnxruntime + espeak-ng. `@cImport piper.h` + link `libpiper.dylib`
-- **No mature Zig port** of Piper exists. The Zig ONNX Runtime wrapper ([recursiveGecko/onnxruntime.zig](https://github.com/recursiveGecko/onnxruntime.zig), 34★) is incomplete and has no CoreML provider
-- **zaudio** ([zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio), miniaudio wrapper) — PCM streaming playback with sub-1s TTFA, callback-driven, no temp WAV
-- **Ghostty-style architecture**: long-lived `PiperEngine` struct, init at daemon boot with `errdefer` for partial unwind, deinit on shutdown. Per-utterance `ArenaAllocator` reset between calls. Root allocator = GPA for debug + leak check
-- **Accepted gap**: Faber-medium voice is Pt-only, EN code-switching still fails. Fix later with a multilingual ONNX voice once available (XTTS ONNX export isn't production-ready per [Coqui discussion #4014](https://github.com/coqui-ai/TTS/discussions/4014))
-- **License**: GPL inherited from libpiper. agent-tts becomes GPL in v1.1+ if it ships the binary. Accepted.
+| Engine | Extra size | Typical warm TTFA | Pt-BR quality | Cost | Offline |
+|---|---|---|---|---|---|
+| **Piper Faber (libpiper FFI)** | ~63 MB voice + ~34 MB dylibs | **~91 ms warm** | Top neural Pt-BR | Free (GPL) | Yes |
+| **macOS `say` Premium** | 0 in binary, ~200 MB system-side | < 200 ms warm | Good (Luciana/Felipe Premium) | Free | Yes |
+| Coqui XTTS-v2 | ~2 GB+ | ~500 ms - 1 s first sentence | Excellent, cloneable | Free | Yes |
+| Kokoro | ~80 MB | ~200 ms | Pt-BR limited, EN fallback | Free | Yes |
+| ElevenLabs | 0 local | 200-800 ms + network RTT | Excellent | Paid + network | No |
 
-## Why `say` Premium wins
+## Why Piper Faber wins as default
 
-1. **Zero weight in the binary**. Voice lives in `/System/Library/Speech/Voices/`. Keeps the small-SSD target
-2. **Apple Neural Engine** is used natively — Luciana Premium is neural, not concatenative
-3. **Consistent TTFA**: daemon pre-warms once (`say -v Luciana ""`), subsequent calls < 200ms
-4. **Acceptable Pt-BR quality** for agent-internal use — we're not shipping audiobooks
-5. **Stable API**: `say` has existed since Mac OS X 10.3, it isn't going to move
-6. **Native SSML-like support**: `[[rate 200]]`, `[[slnc 400]]`, `[[volm 0.8]]`
+1. **Neural quality without Python.** Single Zig binary, no venv to bless.
+2. **Resident engine in the daemon.** The ~400 ms cold load is paid once at boot; every subsequent synth is ~90 ms.
+3. **zaudio streaming PCM.** No WAV temp file, no `afplay` spawn — playback starts the moment the buffer is ready.
+4. **Predictable footprint.** 63 MB voice + 34 MB dylibs, downloaded once via `scripts/fetch-voice.sh` + `scripts/build-libpiper.sh`.
 
-## Why the others lose in v1.0
+## Why `say` Luciana wins as fallback
 
-### Piper
-Good engine. The main Pt-BR voice (`faber-medium`) is OK but robotic. Worth keeping as an offline Linux fallback or in case Apple ever drops `say`. **v1.1+**.
+1. **Zero binary cost.** The voice lives in `/System/Library/Speech/Voices/`. Keeps the no-piper binary under 1 MB.
+2. **Apple Neural Engine.** Luciana Premium is neural under the hood — not pure concatenative.
+3. **Always works.** Available on every macOS install. No vendor build, no ONNX, no download.
+4. **Stable API.** `say` has existed since Mac OS X 10.3.
+5. **Native SSML-like cues**: `[[rate 200]]`, `[[slnc 400]]`, `[[volm 0.8]]`.
 
-### Kokoro
-Pt-BR isn't a first-class target for the project — it falls back to EN with an accent. Rejected.
+## Why the others lose for v1.0
 
 ### Coqui XTTS-v2
-Excellent quality, but 2GB+ blows the SSD budget. Cold TTFA above 1s. Plausible if the goal ever shifts to "clone Gabriel's voice".
+
+Excellent quality, but 2 GB+ breaks the SSD goal and the "only Zig" constraint. ONNX export is not production-stable yet (see [Coqui discussion #4014](https://github.com/coqui-ai/TTS/discussions/4014)). Revisit when ONNX multilingual stabilizes — that is the v1.1 path.
+
+### Kokoro
+
+Pt-BR is not a primary target. EN fallback has an accent. Rejected.
 
 ### ElevenLabs
-Network-dependent latency destroys the KPI. Per-message cost kills casual agent use. Rejected.
 
-## Default voice
+Network-dependent latency wrecks the KPI. Per-message cost kills casual agent use. Offline-only is non-negotiable. Rejected.
 
-`Luciana (Premium)`. User installs via:
+## Voice setup
+
+`Luciana (Premium)`. Install via:
 
 ```
 System Settings → Accessibility → Spoken Content
@@ -77,15 +84,23 @@ System Settings → Accessibility → Spoken Content
 → Portuguese (Brazil) → Luciana (Premium) → Download
 ```
 
-Daemon detects it on first run. If absent → prints the exact instruction + link and degrades to the system's default voice.
+The daemon detects it on first run. If missing, it prints the exact path above and falls back to the default system voice.
 
-Male alternative: `Felipe (Premium)`. Same quality.
+Masculine alternative: `Felipe (Premium)`. Same quality.
 
-## Per-call override
+Piper Faber model is downloaded once by `scripts/fetch-voice.sh` to `~/.cache/agent-tts/voices/pt_BR-faber-medium.onnx` (~63 MB).
+
+## Override per call
 
 ```bash
-agent-tts --voice "Felipe (Premium)" "Text."
-agent-tts --rate 220 "Faster."
+agent-tts "Texto."                              # default piper Faber
+agent-tts --engine say "Texto."                 # macOS say (fallback)
+agent-tts --voice "Felipe (Premium)" "Texto."   # specific say voice
+agent-tts --rate 220 "Mais rápido."             # WPM (say only — piper ignores)
 ```
 
-Persistent config in `~/.config/agent-tts/config.json` (future v0.5+).
+Persistent config in `~/.config/agent-tts/config.json` planned for v1.1.
+
+## Open gap: code-switching EN
+
+`GitHub Actions` is pronounced as Portuguese phonemes today by both Piper Faber and `say`. This is the headline driver for v1.1 — see [What's next](/whats-next/).

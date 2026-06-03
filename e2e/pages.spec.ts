@@ -7,10 +7,11 @@ const pages = [
   { path: 'arquitetura/',  h1: /Architecture/,  splash: false },
   { path: 'motor/',        h1: /TTS engine/,    splash: false },
   { path: 'roadmap/',      h1: /Roadmap/,       splash: false },
+  { path: 'whats-next/',   h1: /What's next/i,  splash: false },
   { path: 'changelog/',    h1: /Changelog/,     splash: false },
 ];
 
-const navEntries = ['Overview', 'Architecture', 'TTS engine', 'Roadmap', 'Changelog'];
+const navEntries = ['Overview', 'Architecture', 'TTS engine', 'Roadmap', "What's next", 'Changelog'];
 
 for (const p of pages) {
   test(`/${p.path} renders with the expected H1`, async ({ page }) => {

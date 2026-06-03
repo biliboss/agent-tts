@@ -31,6 +31,7 @@ export default defineConfig({
         { label: 'Architecture', link: '/arquitetura/' },
         { label: 'TTS engine', link: '/motor/' },
         { label: 'Roadmap', link: '/roadmap/' },
+        { label: "What's next", link: '/whats-next/' },
         { label: 'Changelog', link: '/changelog/' },
       ],
     }),

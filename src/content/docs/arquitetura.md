@@ -1,62 +1,91 @@
 ---
 title: Architecture
-description: Single-binary CLI + daemon, IPC over UNIX socket, SQLite queue, human cadence.
+description: Single Zig binary, CLI + daemon over UNIX socket, SQLite WAL queue, two interchangeable TTS engines (libpiper + macOS say).
 ---
 
 ## TL;DR
 
-Single Zig binary. Two modes in the same executable: client (default) and daemon. The client sends a message to the daemon over a UNIX socket. The daemon queues to SQLite and drains sequentially by calling `say`. Auto-start: if the socket is dead, the client forks+execs the daemon before retrying.
+Single Zig 0.16 binary. Two modes share one executable: client (default) and daemon. The client sends a message over a UNIX socket. The daemon stores it in a SQLite WAL queue and drains serially. Each item is routed to one of two engines: **libpiper** (neural, default) or **macOS `say`** (fallback). Audio plays through **zaudio** (PCM streaming) for piper or directly through `say` for the system voice. Auto-start is handled by **launchd**.
 
-Every piece exists to cut **time-to-first-audio (TTFA)**. Per-piece justification below.
+Every component exists to cut **time-to-first-audio (TTFA)**.
 
 ## Diagram
 
 ```
-┌─────────────┐    UNIX socket    ┌──────────────┐    pipe    ┌────────┐
-│  agent-tts  │ ───────────────▶  │   daemon     │ ─────────▶ │  say   │
-│  (client)   │ ◀── ack + id ─── │  (queue)     │  stdin     │ (afpla)│
-└─────────────┘                   └──────┬───────┘            └────────┘
-                                         │
-                                         ▼
-                                   ~/.cache/agent-tts/
-                                     queue.db (SQLite WAL)
-                                     sock (UNIX)
-                                     daemon.pid
+┌─────────────┐    UNIX socket    ┌────────────────────┐
+│  agent-tts  │ ───ENQUEUE──────▶ │       daemon       │
+│  (client)   │ ◀── OK + id ────  │  - accept loop     │
+└─────────────┘                   │  - SQLite WAL      │
+                                  │  - worker thread   │
+                                  └────────┬───────────┘
+                                           │ route by item.engine
+                              ┌────────────┴────────────┐
+                              ▼                         ▼
+                       ┌─────────────┐          ┌───────────────┐
+                       │  /usr/bin/  │          │   libpiper    │
+                       │    say      │          │  (PiperEngine)│
+                       │  -v Luciana │          │  → s16le PCM  │
+                       └─────────────┘          └──────┬────────┘
+                                                       │
+                                                       ▼
+                                                ┌──────────────┐
+                                                │    zaudio    │
+                                                │  (miniaudio) │
+                                                └──────────────┘
 ```
 
-## Pieces
+Filesystem layout:
 
-### Language: Zig 0.14+
+```
+~/.cache/agent-tts/
+  queue.db          SQLite WAL (items + state machine)
+  sock              UNIX stream socket
+  voices/           Piper ONNX models (downloaded once)
+  daemon.out.log    launchd stdout
+  daemon.err.log    launchd stderr
 
-- Native Apple Silicon binary, no runtime/GC
-- Predictable latency (no stop-the-world)
-- Direct FFI to Cocoa later if `say` stops being enough
-- Stripped < 2MB
+~/Library/LaunchAgents/
+  io.github.biliboss.agent-tts.plist
+```
+
+## Components
+
+### Language: Zig 0.16
+
+- Native arm64 / x86_64 binary, no runtime, no GC
+- Predictable latency, no stop-the-world
+- Direct FFI to `libpiper`, `libsqlite3`, and `miniaudio` via `@cImport`
+- ReleaseFast with libpiper linked: **~975 KB**
 
 Version pinned in `build.zig.zon` — Zig still breaks between minor releases.
 
-### CLI + daemon, same binary
+### CLI + daemon share the binary
 
-Shrinks install surface. `agent-tts` with no args = client. `agent-tts daemon` = server. Detection via argv[1].
+Cuts install surface. `agent-tts` without args = client. `agent-tts daemon` = server. Dispatch by `argv[1]`.
 
-**Auto-start**: client tries to connect to the socket. On failure → `fork()` + `execve(self, "daemon", "--detach")` → retry with 10ms × 5 backoff. The first cold call pays ~500ms; subsequent calls hit ack in < 50ms.
+The client does NOT fork the daemon. The daemon survives because of launchd (`agent-tts daemon install`), so the warm-path round-trip stays under a millisecond.
 
 ### IPC: UNIX socket
 
-`~/.cache/agent-tts/sock`. Faster than TCP loopback (no checksum, no TCP stack). Protocol: line-framed JSON.
+Path: `~/.cache/agent-tts/sock`. Faster than TCP loopback (no checksum, no TCP stack). Line-delimited TSV protocol:
 
 ```
-→ {"op":"enqueue","text":"olá","voice":"Luciana","rate":180}
-← {"ok":true,"id":42}
+→ ENQUEUE\t<engine>\t<voice>\t<rate>\t<text>\n
+← OK\t<id>\n
 ```
 
-Socket cleanup: daemon registers SIGTERM/SIGINT handler → `unlink(sock)`. On startup, it checks whether the PID in `daemon.pid` is still alive before claiming an orphan socket.
+Other ops:
+- `QUEUE\n` → daemon emits `ITEM\t<id>\t<state>\t<engine>\t<voice>\t<rate>\t<text>\n` lines followed by `END\n`
+- `SKIP\n` → SIGTERMs the current `say` PID (or signals piper playback to stop) → `OK\t<id>\n`
+- `CLEAR\n` → marks every pending item as `skipped` → `OK\t<count>\n`
 
-### Queue: SQLite (WAL)
+Cleanup: the daemon registers SIGTERM/SIGINT and unlinks the socket on exit. On startup it checks if the PID in `daemon.pid` is still alive before assuming an orphan socket.
 
-`~/.cache/agent-tts/queue.db`. Survives reboot + crash. WAL mode lets the worker drain without blocking `agent-tts queue` (read-only).
+### Queue: SQLite WAL
 
-Minimal schema:
+`~/.cache/agent-tts/queue.db`. Survives daemon crash, reboot, and SKIP. WAL mode lets the worker drain without blocking `agent-tts queue` reads.
+
+Schema:
 
 ```sql
 CREATE TABLE items (
@@ -64,56 +93,96 @@ CREATE TABLE items (
   text TEXT NOT NULL,
   voice TEXT,
   rate INTEGER,
-  state TEXT NOT NULL DEFAULT 'pending', -- pending|playing|done|skipped
+  engine TEXT NOT NULL DEFAULT 'say',
+  state TEXT NOT NULL DEFAULT 'pending',
   enqueued_at INTEGER NOT NULL,
   started_at INTEGER,
   finished_at INTEGER
 );
 ```
 
-Worker: 1 goroutine-equivalent (single-threaded loop). Never two `say` invocations in parallel — overlap is bad UX. Implicit mutex via the single-consumer queue.
+Worker = a single thread loop. Never two synth/playback in parallel — overlap kills UX. Mutual exclusion is implicit from the single-consumer queue.
 
-### Audio driver: `say` (libexec)
+Crash recovery on daemon boot: `UPDATE items SET state='pending' WHERE state='playing'` re-promotes orphan items from the previous run.
 
-`/usr/bin/say -v "Luciana (Premium)" -r 180`. Text via stdin. Full justification in [TTS engine](/motor/).
+### Engine routing
 
-Pre-warm: at boot the daemon runs `say -v Luciana ""` to force the model into the Neural Engine. Without pre-warm, the first call pays an extra ~200-400ms.
+Selected per item via the `engine` column. The worker picks the matching path:
 
-### Human cadence
+| `item.engine` | Path |
+|---------------|------|
+| `say` | `tts.spawnSay(voice, rate, preprocessed_text)` → blocks on `wait()` |
+| `piper` | `PiperEngine.synthToSamples(text)` → `AudioPlayer.streamS16le(samples, 22050)` |
 
-Default 180 WPM (typical Pt-BR speaker is ~160-180). Zig pre-processor does:
+If `--engine piper` arrives but the engine is not loaded (binary built without `-Dwith-piper=true`, or `AGENT_TTS_PIPER=1` was not set), the worker logs a warning and falls back to `say`.
+
+### libpiper FFI
+
+Vendored from [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl) at tag `v1.4.2`. Built once via `scripts/build-libpiper.sh`. Links against `libpiper.dylib` + `libonnxruntime.1.22.0.dylib` (resolved via `@rpath`).
+
+`PiperEngine` is a Zig struct owning the C handle. Init loads the ONNX voice model (~400 ms cold), exposes `synthToSamples(text) → []i16`. Lives in daemon-scoped storage so the cold cost is paid once.
+
+License: GPL-3.0-or-later. Built into the binary only when `-Dwith-piper=true`; without it, the binary is MIT/Apache.
+
+### Audio: zaudio (miniaudio)
+
+Vendored from [zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio). Linked against CoreAudio / AudioUnit / AudioToolbox frameworks on macOS. The daemon owns one `zaudio.Engine` instance.
+
+`AudioPlayer.streamS16le(samples, 22050)` creates an `AudioBuffer` data source pinned to the source rate (22050 Hz for Faber). Without the explicit sample rate, miniaudio upsamples to the device rate (48000 Hz) and pitch shifts ~2.18× higher — a fix shipped in v1.0.
+
+### Drive: `say` (libexec)
+
+`/usr/bin/say -v "Luciana (Premium)" -r 330`. Used as the fallback engine.
+
+Pre-warm: the daemon boots `say -v Luciana ""` to load the voice into the Neural Engine. Without pre-warm, the first call pays an extra 200-400 ms.
+
+### Pt-BR preprocessor (v0.5)
+
+Runs before each engine sees the text. Three transforms, single pass each, allocated in a per-utterance arena:
 
 | Input | Output |
-|---------|-------|
-| `,` | + `[[slnc 150]]` |
-| `.` `!` `?` | + `[[slnc 400]]` |
-| `\n` | + `[[slnc 600]]` |
+|-------|--------|
+| `,` | `, [[slnc 150]]` |
+| `.` `!` `?` | `<punct> [[slnc 400]]` |
+| `\n` | `[[slnc 600]]` |
 | `Sr.` | `Senhor` |
 | `cf.` | `conforme` |
-| `123` | `cento e vinte e três` (Pt-BR cardinals) |
+| `123` | `cento e vinte e três` (cardinals 0..9999) |
+| `R$` | `reais` |
 
-`[[slnc N]]` directives are literals consumed by `say`, in milliseconds.
+`[[slnc N]]` directives are literal `say` commands; piper ignores them.
+
+Total wall time: 2-5 µs per message. No TTFA risk.
+
+### launchd auto-start
+
+`agent-tts daemon install` writes `~/Library/LaunchAgents/io.github.biliboss.agent-tts.plist` and bootstraps it into the `gui/<uid>` domain. KeepAlive uses the `SuccessfulExit=false` dict form — a clean `bootout` actually stays out.
+
+Plist write is atomic (`createFileAtomic` + `replace`). The `HOME` env var is injected explicitly because launchd does not inherit it pre-login.
 
 ## Code layout
 
 ```
 src/
-  main.zig          # entry, parse argv, route client|daemon
-  client.zig        # connect, enqueue, status
-  daemon.zig        # accept loop + worker
-  queue.zig         # SQLite wrapper
-  tts.zig           # invokes say, manages the process, pre-warm
-  preproc.zig       # normalization + pauses
-  ipc.zig           # socket protocol (JSON-line)
-build.zig
-build.zig.zon
+  main.zig         # entry, argv routing, ttfa-bench + piper-test subcommands
+  client.zig       # enqueue, queue, skip, clear
+  daemon.zig       # accept loop, worker, engine routing
+  queue.zig        # SQLite WAL wrapper, schema migration
+  ipc.zig          # line protocol, sanitize, Engine enum
+  tts.zig          # spawn `say`
+  piper.zig        # libpiper FFI (GPL-3.0-or-later)
+  audio.zig        # zaudio.Engine wrapper
+  preproc.zig      # Pt-BR cadence + abbreviations + cardinals
+  launchd.zig      # LaunchAgent install / uninstall / status
 ```
 
-Flat. No subdirs until they earn it.
+Flat. No subdir until it hurts.
 
-## Expected gotchas
+## Locked gotchas
 
-- `say -v Luciana` silently fails if the voice isn't installed. Daemon validates with `say -v '?'` at boot and logs an explicit warning
-- Orphan socket after SIGKILL — startup checks the PID file before claiming it
-- SQLite without WAL blocks `queue` during `playing` — always WAL
-- Zig stdlib still moves the child process API around between versions; isolate in `tts.zig`
+- `say -v Luciana` silently fails if the voice is not installed. The daemon validates with `say -v '?'` at boot and logs a warning.
+- Orphan socket after SIGKILL — startup checks the PID file before reusing it.
+- SQLite without WAL blocks `queue` during `playing`. Always WAL.
+- `AudioBuffer.Config.sample_rate` must be set explicitly; the default upsamples to engine rate and shifts pitch.
+- espeak-ng (under libpiper) caps phoneme source paths at 160 bytes. Build libpiper in a short path (`/tmp/agent-tts-piper-build`); the vendor script does this for you.
+- `char32_t` in `piper.h` fails Zig's `translate-c`. Shim with `@cDefine("char32_t", "uint32_t")` before `@cInclude`.
