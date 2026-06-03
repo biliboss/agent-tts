@@ -134,15 +134,11 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
     }
     defer audio_player.deinit();
 
-    // Optional libpiper engine. Off by default; opt in via AGENT_TTS_PIPER=1.
-    // Lives until process exit so v0.7's worker can synth without paying the
-    // ~400ms cold load each call.
-    //
-    // v1.1: load BOTH voices when piper is enabled. Pt (Faber) is mandatory;
-    // En (Amy) is best-effort — daemon stays usable if the En voice isn't
-    // on disk yet. Cold cost ~700 ms when both load (was ~340 ms in v0.7
-    // with just Pt). User who never wants En can stick to v1.0 by not
-    // running `scripts/fetch-voice-en.sh`.
+    // libpiper engine. Loads on every boot when the binary is built with
+    // -Dwith-piper=true. Pt (Faber) mandatory; En (Amy) best-effort. Cold
+    // cost ~700 ms when both load. Opt-out via AGENT_TTS_PIPER=0 (kept for
+    // CI / debugging — daemon then runs `say`-only like the v1.0 universal
+    // binary).
     var piper_engine_storage: ?piper_mod.MultiPiperEngine = null;
     var piper_engine_ptr: ?*piper_mod.MultiPiperEngine = null;
     if (build_options.enabled) {
@@ -150,7 +146,8 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
             @cInclude("stdlib.h");
         });
         const env_ptr = c.getenv("AGENT_TTS_PIPER");
-        if (env_ptr != null and std.mem.eql(u8, std.mem.span(env_ptr), "1")) {
+        const piper_off = env_ptr != null and std.mem.eql(u8, std.mem.span(env_ptr), "0");
+        if (!piper_off) {
             if (bootMultiPiper(arena, io, home)) |engine| {
                 piper_engine_storage = engine;
                 piper_engine_ptr = &piper_engine_storage.?;

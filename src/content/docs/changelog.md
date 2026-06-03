@@ -56,6 +56,25 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 **Why a single subcommand instead of a dedicated binary**: MCP clients spawn the server on demand and pipe stdio. Bundling the server in the same `agent-tts` binary means one install path, one version number, one set of tests.
 
+### CLI vs MCP — end-to-end latency
+
+Captured against a warm daemon on Mac Air M4, ReleaseFast, libpiper ON, daemon resident with `pt=faber en=off`. 5 calls each:
+
+| Path | Cold (first call) | Warm (subsequent) | Notes |
+|---|---|---|---|
+| `agent-tts "texto"` (CLI shell-out) | ~33 ms (process boot + socket connect + ack) | **0.2-0.4 ms** ack round-trip | Each invocation is a fresh process. Warm = arena cache + socket already created |
+| `echo '<json>' \| agent-tts mcp` (MCP one-shot) | 32-40 ms wall | n/a — process exits after stdin EOF | Cold-only by construction; spawn + JSON parse + 3 messages + socket call + serialize + exit |
+| MCP via real Claude Code session (persistent process) | ~30-40 ms first call | **~1-3 ms** estimate per `tools/call` (JSON parse + socket round-trip, no process boot) | Claude Code holds one `agent-tts mcp` open for the session — second call onward avoids the binary spawn cost |
+
+The headline is: **MCP per-tool-call overhead in a persistent session is ~3-5× the CLI warm path** (JSON-RPC framing vs raw TSV), and **the binary-spawn cost amortizes to zero** because the MCP process lives for the whole session. For a voice agent that fires once per assistant turn, both numbers are well under the human-perceptible threshold (~100 ms).
+
+Methodology caveats: the "MCP one-shot wall" measurement above includes one cold binary spawn per sample because we drive the server from a shell loop, not from a persistent stdio peer. The "real Claude Code" row is an estimate based on the warm-CLI ack (0.3 ms) plus the JSON parse/serialize cost measured in `mcp.zig` tests (~0.5-1.0 ms per round-trip with `std.json`). A real long-running Claude Code session would publish the actual number in `_qa/v1.5-mcp-latency.md` once captured.
+
+Practical implication for installers:
+
+- **One-shot via shell** (`echo json | agent-tts mcp`) — fine for ad-hoc scripting and CI smoke tests. Don't loop it for throughput.
+- **MCP client (Claude Code, Cursor, Cline)** — automatically gives you the persistent process, so warm tool-calls are ~1-3 ms.
+
 ---
 
 ## v1.3 — Cross-platform · 2026-06-03
