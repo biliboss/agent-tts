@@ -4,13 +4,13 @@ import { test, expect } from '@playwright/test';
 // would escape the base path — see playwright.config.ts for the rationale.
 const pages = [
   { path: '',              h1: /agent-tts/i,    splash: true },
-  { path: 'arquitetura/',  h1: /Arquitetura/,   splash: false },
-  { path: 'motor/',        h1: /Motor TTS/,     splash: false },
+  { path: 'arquitetura/',  h1: /Architecture/,  splash: false },
+  { path: 'motor/',        h1: /TTS engine/,    splash: false },
   { path: 'roadmap/',      h1: /Roadmap/,       splash: false },
   { path: 'changelog/',    h1: /Changelog/,     splash: false },
 ];
 
-const navEntries = ['Visão', 'Arquitetura', 'Motor TTS', 'Roadmap', 'Changelog'];
+const navEntries = ['Overview', 'Architecture', 'TTS engine', 'Roadmap', 'Changelog'];
 
 for (const p of pages) {
   test(`/${p.path} renders with the expected H1`, async ({ page }) => {
@@ -53,7 +53,7 @@ test('home links to the architecture page', async ({ page }) => {
   await page.goto('');
   // Splash hero + CardGrid both link there. .first() picks whichever comes
   // first in DOM order; either is fine.
-  const link = page.getByRole('link', { name: /arquitetura/i }).first();
+  const link = page.getByRole('link', { name: /architecture/i }).first();
   await expect(link).toBeVisible();
   await link.click();
   await expect(page).toHaveURL(/\/agent-tts\/arquitetura\/?$/);

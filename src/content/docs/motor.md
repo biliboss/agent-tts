@@ -1,75 +1,75 @@
 ---
-title: Motor TTS
-description: Comparativo de motores Pt-BR e por que `say` Premium Luciana ganha na v1.0.
+title: TTS engine
+description: Pt-BR engine comparison and why `say` Premium Luciana wins in v1.0.
 ---
 
 ## TL;DR
 
-Escolha **v1.0**: `say` Luciana ganha — TTFA + tamanho + Neural Engine nativo. Decisão revisitada na **v1.1+** porque agentes falam Pt-BR com termos em inglês ("GitHub Actions", "Coolify deploy") e `say` monolingual pronuncia errado.
+**v1.0** pick: `say` Luciana wins — TTFA + size + native Neural Engine. The decision is revisited in **v1.1+** because agents speak Pt-BR with English terms ("GitHub Actions", "Coolify deploy") and monolingual `say` mispronounces them.
 
-**Plano v1.1+**: motor multilingual via Python sidecar. **XTTS-v2** (Coqui) escolhido por code-switching nativo Pt+En + qualidade neural top. Custa ~3GB no disco e exige sidecar Python (modelo precisa ficar resident). Decisão tomada 2026-06-03 depois de benchmark com Piper Faber (mono Pt, falhou em EN) e XTTS-v2 CLI (qualidade top mas 27s/call no CLI por reload do modelo).
+**v1.1+ plan**: multilingual engine via Python sidecar. **XTTS-v2** (Coqui) picked for native Pt+En code-switching plus top neural quality. Costs ~3GB on disk and needs a Python sidecar (the model must stay resident). Decision made 2026-06-03 after benchmarking Piper Faber (Pt-only, failed on EN) and XTTS-v2 CLI (top quality but 27s/call from the CLI due to model reload).
 
-## Comparativo
+## Comparison
 
-Critério primário é **time-to-first-audio**. Critério secundário é tamanho no disco (Mac Air M4 com SSD pequeno).
+Primary criterion is **time-to-first-audio**. Secondary criterion is disk size (Mac Air M4 with a small SSD).
 
-| Motor | Tamanho extra | TTFA típico | Qualidade Pt-BR | Custo | Offline |
+| Engine | Extra size | Typical TTFA | Pt-BR quality | Cost | Offline |
 |-------|---------------|-------------|------------------|-------|---------|
-| **macOS `say` Premium** | 0 no binary, ~200MB no sistema (voz Premium) | **< 200ms** quente | Boa (Luciana/Felipe Premium) | Grátis | Sim |
-| Piper (`pt_BR-faber-medium`) | ~63MB voz + ~10MB runtime | ~100ms | OK, robótica | Grátis (MIT) | Sim |
-| Kokoro | ~80MB | ~200ms | Pt-BR limitado, fallback EN | Grátis (Apache) | Sim |
-| Coqui XTTS-v2 | ~2GB+ | ~500ms-1s primeira frase | Excelente, cloneable | Grátis | Sim |
-| ElevenLabs | 0 local | 200-800ms + RTT rede | Excelente | Pago + rede | Não |
+| **macOS `say` Premium** | 0 in the binary, ~200MB system-side (Premium voice) | **< 200ms** warm | Good (Luciana/Felipe Premium) | Free | Yes |
+| Piper (`pt_BR-faber-medium`) | ~63MB voice + ~10MB runtime | ~100ms | OK, robotic | Free (MIT) | Yes |
+| Kokoro | ~80MB | ~200ms | Pt-BR limited, EN fallback | Free (Apache) | Yes |
+| Coqui XTTS-v2 | ~2GB+ | ~500ms-1s first sentence | Excellent, cloneable | Free | Yes |
+| ElevenLabs | 0 local | 200-800ms + network RTT | Excellent | Paid + network | No |
 
-## Benchmark 2026-06-03 + decisão v1.1+
+## Benchmark 2026-06-03 + v1.1+ decision
 
-Driver da revisão: agentes falam Pt-BR com termos em inglês ("GitHub Actions", "Coolify deploy") e `say` monolingual pronuncia errado. Testado: Piper Faber (mono Pt, Python via uvx) e XTTS-v2 multilingual.
+Driver for the review: agents speak Pt-BR with English terms ("GitHub Actions", "Coolify deploy") and monolingual `say` mispronounces them. Tested: Piper Faber (Pt-only, Python via uvx) and multilingual XTTS-v2.
 
-| Engine | Footprint | TTFA real (agent UX) | Code-switch | Veredito |
+| Engine | Footprint | Real TTFA (agent UX) | Code-switch | Verdict |
 |--------|-----------|----------------------|-------------|----------|
-| say Luciana | 0 | ~50ms (daemon quente) | ruim | mantém na v1.0 |
-| Piper Faber via uvx | 250MB | ~650ms | ruim | rejeitado (mono Pt + python dep) |
-| XTTS-v2 CLI Python | 3GB | 27s/call (Python reload) | bom | rejeitado (CLI unviável, sidecar Python rejeitado por "only Zig") |
+| say Luciana | 0 | ~50ms (warm daemon) | bad | keep in v1.0 |
+| Piper Faber via uvx | 250MB | ~650ms | bad | rejected (Pt-only + python dep) |
+| XTTS-v2 CLI Python | 3GB | 27s/call (Python reload) | good | rejected (CLI unviable, Python sidecar blocked by "only Zig") |
 
-Disco antes: 8.4GB free. XTTS reservou 3GB. Limpeza pós-decisão liberou tudo.
+Disk before: 8.4GB free. XTTS reserved 3GB. Cleanup after the decision freed it all.
 
-### Plano v1.1+ travado: **libpiper FFI**
+### v1.1+ plan locked: **libpiper FFI**
 
-Restrição auto-imposta: **only Zig** owns o lifecycle. Sem sidecar Python. Pesquisa em OSS Zig (Ghostty, zml, matklad notes, zaudio):
+Self-imposed constraint: **only Zig** owns the lifecycle. No Python sidecar. Survey of Zig OSS (Ghostty, zml, matklad notes, zaudio):
 
-- **libpiper** (de [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl), 4.3k★, GPL) — única C API limpa, atualizada, com voz Pt-BR. Build via CMake puxa onnxruntime + espeak-ng. `@cImport piper.h` + link `libpiper.dylib`
-- **Não existe Zig port** maduro de Piper. Wrapper ONNX Runtime em Zig ([recursiveGecko/onnxruntime.zig](https://github.com/recursiveGecko/onnxruntime.zig), 34★) é incompleto, sem CoreML provider
-- **zaudio** ([zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio), miniaudio wrap) — playback PCM streaming sub-1s TTFA, callback-driven, sem WAV temporário
-- **Arquitetura Ghostty-style**: struct `PiperEngine` long-lived, init no daemon boot com `errdefer` pra unwind parcial, deinit no shutdown. Per-utterance `ArenaAllocator` reset entre chamadas. Allocator root = GPA pra debug + leak check
-- **Gap aceito**: voz Faber-medium é mono Pt, code-switching EN ainda falha. Resolver depois com voz multilingual ONNX quando disponível (XTTS ONNX export ainda não é produção segundo [Coqui discussion #4014](https://github.com/coqui-ai/TTS/discussions/4014))
-- **License**: GPL herda do libpiper. agent-tts vira GPL na v1.1+ se distribuir binário. Aceito.
+- **libpiper** (from [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl), 4.3k★, GPL) — the only clean, maintained C API with a Pt-BR voice. Built via CMake, which pulls onnxruntime + espeak-ng. `@cImport piper.h` + link `libpiper.dylib`
+- **No mature Zig port** of Piper exists. The Zig ONNX Runtime wrapper ([recursiveGecko/onnxruntime.zig](https://github.com/recursiveGecko/onnxruntime.zig), 34★) is incomplete and has no CoreML provider
+- **zaudio** ([zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio), miniaudio wrapper) — PCM streaming playback with sub-1s TTFA, callback-driven, no temp WAV
+- **Ghostty-style architecture**: long-lived `PiperEngine` struct, init at daemon boot with `errdefer` for partial unwind, deinit on shutdown. Per-utterance `ArenaAllocator` reset between calls. Root allocator = GPA for debug + leak check
+- **Accepted gap**: Faber-medium voice is Pt-only, EN code-switching still fails. Fix later with a multilingual ONNX voice once available (XTTS ONNX export isn't production-ready per [Coqui discussion #4014](https://github.com/coqui-ai/TTS/discussions/4014))
+- **License**: GPL inherited from libpiper. agent-tts becomes GPL in v1.1+ if it ships the binary. Accepted.
 
-## Por que `say` Premium ganha
+## Why `say` Premium wins
 
-1. **Zero peso no binary**. Voz mora em `/System/Library/Speech/Voices/`. Mantém alvo SSD pequeno
-2. **Apple Neural Engine** usado nativamente — Luciana Premium é neural, não concatenativa
-3. **TTFA consistente**: daemon faz pre-warm uma vez (`say -v Luciana ""`), próximas chamadas < 200ms
-4. **Qualidade Pt-BR aceitável** pra uso interno de agentes — não estamos vendendo audiobook
-5. **API estável**: `say` existe desde Mac OS X 10.3, não vai mudar
-6. **Suporte nativo a SSML-like**: `[[rate 200]]`, `[[slnc 400]]`, `[[volm 0.8]]`
+1. **Zero weight in the binary**. Voice lives in `/System/Library/Speech/Voices/`. Keeps the small-SSD target
+2. **Apple Neural Engine** is used natively — Luciana Premium is neural, not concatenative
+3. **Consistent TTFA**: daemon pre-warms once (`say -v Luciana ""`), subsequent calls < 200ms
+4. **Acceptable Pt-BR quality** for agent-internal use — we're not shipping audiobooks
+5. **Stable API**: `say` has existed since Mac OS X 10.3, it isn't going to move
+6. **Native SSML-like support**: `[[rate 200]]`, `[[slnc 400]]`, `[[volm 0.8]]`
 
-## Por que os outros perdem na v1.0
+## Why the others lose in v1.0
 
 ### Piper
-Bom motor. Voz Pt-BR principal (`faber-medium`) é OK mas robotizada. Vale como fallback offline em Linux ou se Apple algum dia remover `say`. **v1.1+**.
+Good engine. The main Pt-BR voice (`faber-medium`) is OK but robotic. Worth keeping as an offline Linux fallback or in case Apple ever drops `say`. **v1.1+**.
 
 ### Kokoro
-Pt-BR não é alvo nativo do projeto, faz fallback pra EN com sotaque. Reprovado.
+Pt-BR isn't a first-class target for the project — it falls back to EN with an accent. Rejected.
 
 ### Coqui XTTS-v2
-Qualidade excelente, mas 2GB+ quebra a meta de SSD. TTFA cold acima de 1s. Cabível se um dia a meta mudar pra "clonagem de voz do Gabriel".
+Excellent quality, but 2GB+ blows the SSD budget. Cold TTFA above 1s. Plausible if the goal ever shifts to "clone Gabriel's voice".
 
 ### ElevenLabs
-Latência dependente de rede destrói o KPI. Custo por mensagem mata uso casual de agente. Reprovado.
+Network-dependent latency destroys the KPI. Per-message cost kills casual agent use. Rejected.
 
-## Voz padrão
+## Default voice
 
-`Luciana (Premium)`. Usuário instala via:
+`Luciana (Premium)`. User installs via:
 
 ```
 System Settings → Accessibility → Spoken Content
@@ -77,15 +77,15 @@ System Settings → Accessibility → Spoken Content
 → Portuguese (Brazil) → Luciana (Premium) → Download
 ```
 
-Daemon detecta na primeira run. Ausente → printa instrução exata + link e cai pra voz default do sistema como degradado.
+Daemon detects it on first run. If absent → prints the exact instruction + link and degrades to the system's default voice.
 
-Alternativa masculina: `Felipe (Premium)`. Mesma qualidade.
+Male alternative: `Felipe (Premium)`. Same quality.
 
-## Override por chamada
+## Per-call override
 
 ```bash
-agent-tts --voice "Felipe (Premium)" "Texto."
-agent-tts --rate 220 "Mais rápido."
+agent-tts --voice "Felipe (Premium)" "Text."
+agent-tts --rate 220 "Faster."
 ```
 
-Config persistente em `~/.config/agent-tts/config.json` (futuro v0.5+).
+Persistent config in `~/.config/agent-tts/config.json` (future v0.5+).

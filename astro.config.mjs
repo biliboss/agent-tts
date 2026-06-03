@@ -13,7 +13,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'agent-tts',
-      description: 'Zig CLI global pra TTS Pt-BR no macOS. KPI: tempo até começar a ouvir.',
+      description: 'Global Zig CLI for Pt-BR TTS on macOS. KPI: time-to-first-audio.',
       customCss: ['./src/styles/custom.css'],
       social: {
         github: 'https://github.com/biliboss/agent-tts',
@@ -22,9 +22,9 @@ export default defineConfig({
         baseUrl: 'https://github.com/biliboss/agent-tts/edit/main/',
       },
       sidebar: [
-        { label: 'Visão', link: '/' },
-        { label: 'Arquitetura', link: '/arquitetura/' },
-        { label: 'Motor TTS', link: '/motor/' },
+        { label: 'Overview', link: '/' },
+        { label: 'Architecture', link: '/arquitetura/' },
+        { label: 'TTS engine', link: '/motor/' },
         { label: 'Roadmap', link: '/roadmap/' },
         { label: 'Changelog', link: '/changelog/' },
       ],

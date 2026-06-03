@@ -1,5 +1,11 @@
 # vendor/ — libpiper FFI (v0.6+)
 
+> **License: GPL-3.0-or-later inherits when linking.** Building agent-tts with
+> `-Dwith-piper=true` links against libpiper (GPL-3.0) and its vendored
+> espeak-ng (GPL-3.0). The resulting binary inherits GPL-3.0-or-later when
+> distributed. The default build (`zig build`) does NOT link libpiper and stays
+> MIT OR Apache-2.0. See "Licenses (read before shipping)" below for details.
+
 This directory holds vendored C/C++ code that agent-tts links against. It is
 intentionally **not committed** (gitignored under `vendor/piper1-gpl/`). This
 README is the reproduction recipe.

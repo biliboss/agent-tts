@@ -1,122 +1,122 @@
 # AGENTS.md — agent-tts docs
 
-Astro Starlight site documentando o projeto **agent-tts** (Zig CLI global pra TTS Pt-BR no macOS).
+Astro Starlight site documenting the **agent-tts** project (global Zig CLI for Pt-BR TTS on macOS).
 
-## Propósito
+## Purpose
 
-Documento vivo de decisões, arquitetura e roadmap. Audiência: maintainers + agentes (Claude Code) que vão evoluir o projeto.
+Source of truth for decisions, architecture, and roadmap. Audience: maintainers + Claude Code agents who will evolve the project.
 
-## KPI único
+## Single KPI
 
-**Time-to-first-audio (TTFA)**: latência entre `agent-tts "x"` e primeiro sample audível. Toda decisão se justifica contra essa métrica. Alvo v1.0: < 300ms quente, < 800ms cold.
+**Time-to-first-audio (TTFA)**: latency between `agent-tts "x"` and the first audible sample. Every decision is justified against this metric. v1.0 target: < 300ms warm, < 800ms cold.
 
-## Estrutura (flat, 4 páginas)
+## Structure (flat, 4 pages)
 
 ```
 src/content/docs/
-  index.mdx       # Splash + KPI + restrições
-  arquitetura.md  # CLI+daemon, IPC socket, fila SQLite, cadência
-  motor.md        # Comparativo TTS + escolha say Premium Luciana
-  roadmap.md      # Marcos v0.1 → v1.0 + medição do KPI
+  index.mdx       # Splash + KPI + constraints
+  arquitetura.md  # CLI+daemon, IPC socket, SQLite queue, pacing
+  motor.md        # TTS comparison + why we picked say Premium Luciana
+  roadmap.md      # Milestones v0.1 → v1.0 + how we measure the KPI
 ```
 
-Sem subdir. Sem grupos no sidebar. Adicionar página só quando uma decisão nova não couber em nenhuma existente.
+No subdirs. No sidebar groups. Add a new page only when a new decision doesn't fit any existing one.
 
-## Rodar local
+## Run locally
 
 ```bash
 npm install
-npm run dev          # porta random + sync puma-dev
-npm run dev:fixed    # porta 4321 fixa (debug)
+npm run dev          # random port + puma-dev sync
+npm run dev:fixed    # fixed port 4321 (debug)
 ```
 
-`npm run dev` (definido em `scripts/dev.mjs`):
+`npm run dev` (defined in `scripts/dev.mjs`):
 
-1. Pede porta livre ao kernel (`net.createServer().listen(0)` → fecha → herda o número)
-2. Escreve `~/.puma-dev/agent-tts` com a porta sorteada (se puma-dev existe)
-3. `spawn('astro', ['dev', '--port', porta])`
-4. SIGINT/SIGTERM → limpa o arquivo do puma-dev antes de sair
+1. Asks the kernel for a free port (`net.createServer().listen(0)` → close → inherit the number)
+2. Writes `~/.puma-dev/agent-tts` with the drawn port (if puma-dev exists)
+3. `spawn('astro', ['dev', '--port', port])`
+4. SIGINT/SIGTERM → cleans the puma-dev file before exiting
 
-Zero conflito de porta. URL pública estável (`http://agent-tts.test`), porta atrás dela muda a cada run.
+Zero port conflicts. Stable public URL (`http://agent-tts.test`), with the port behind it changing every run.
 
-Build estático:
+Static build:
 
 ```bash
 npm run build
 npm run preview
 ```
 
-## Acesso via DNS local (puma-dev)
+## Local DNS access (puma-dev)
 
-Padrão do vault pra dev servers locais: **puma-dev** (~10MB Go binary, launchd, `/etc/resolver/test`). Mapeia `agent-tts.test:80 → localhost:<porta-random>` automático.
+Project standard for local dev servers: **puma-dev** (~10MB Go binary, launchd, `/etc/resolver/test`). Maps `agent-tts.test:80 → localhost:<random-port>` automatically.
 
-Setup uma vez por máquina:
+One-time setup per machine:
 
 ```bash
 brew install puma/puma/puma-dev
-sudo puma-dev -setup       # cria /etc/resolver/test
-puma-dev -install          # registra launchd
+sudo puma-dev -setup       # creates /etc/resolver/test
+puma-dev -install          # registers launchd
 ```
 
-Sem comando manual por projeto — `npm run dev` já escreve `~/.puma-dev/agent-tts` com a porta certa toda vez.
+No manual per-project command — `npm run dev` writes `~/.puma-dev/agent-tts` with the right port every time.
 
 Stop/remove:
 
 ```bash
-puma-dev -uninstall                  # remove launchd geral
-rm ~/.puma-dev/agent-tts             # remove só este projeto (npm run dev limpa sozinho no SIGINT)
+puma-dev -uninstall                  # removes launchd globally
+rm ~/.puma-dev/agent-tts             # removes just this project (npm run dev cleans up on SIGINT)
 ```
 
-Por que random port + puma-dev:
+Why random port + puma-dev:
 
-- Random port = zero conflito quando rodo 3 projetos em paralelo
-- puma-dev = URL fixa pra bookmark, history, browser, screenshot
-- Sync automático no `dev.mjs` = sem lembrar de editar `~/.puma-dev/<app>` na mão
+- Random port = zero conflicts when running 3 projects in parallel
+- puma-dev = fixed URL for bookmarks, history, browser, screenshots
+- Auto-sync in `dev.mjs` = no need to remember editing `~/.puma-dev/<app>` by hand
 
-## Convenções de página
+## Page conventions
 
-- **Frontmatter mínimo**: `title`, `description`
-- **TL;DR no topo**: 1 parágrafo antes de qualquer seção
-- **Tabelas > prosa** pra tradeoffs, métricas, comparativos
-- **Markdown puro** (`.md`). MDX (`.mdx`) só na index (precisa de Card/CardGrid)
-- **Sem emoji decorativo**. Só ✅/⚠️/❌ em tabelas de avaliação
-- **Cada decisão precisa de justificativa amarrada ao KPI** — se não move TTFA, sai do doc
+- **Minimum frontmatter**: `title`, `description`
+- **TL;DR at the top**: 1 paragraph before any section
+- **Tables > prose** for tradeoffs, metrics, comparisons
+- **Plain Markdown** (`.md`). MDX (`.mdx`) only on the index (needs Card/CardGrid)
+- **No decorative emoji**. Only ✅/⚠️/❌ in evaluation tables
+- **Every decision needs a justification tied to the KPI** — if it doesn't move TTFA, it doesn't belong in the doc
 
-## Como adicionar página
+## Adding a page
 
-1. Cria `src/content/docs/<slug>.md`
-2. Adiciona ao `sidebar` em `astro.config.mjs`
-3. Linka da página relacionada
-4. Roda `npm run dev` e checa render
+1. Create `src/content/docs/<slug>.md`
+2. Add it to the `sidebar` in `astro.config.mjs`
+3. Link it from the related page
+4. Run `npm run dev` and check the render
 
-## Stack do projeto documentado
+## Documented project stack
 
-Resumo travado (detalhe nas páginas):
+Locked summary (details on the pages):
 
-- **Linguagem**: Zig 0.14+ (binary < 2MB, nativo Apple Silicon)
-- **Motor TTS**: macOS `say` com voz "Luciana (Premium)"
-- **Arquitetura**: single binary, modo client + modo daemon
-- **IPC**: UNIX socket em `~/.cache/agent-tts/sock`
-- **Fila**: SQLite WAL em `~/.cache/agent-tts/queue.db`
+- **Language**: Zig 0.14+ (binary < 2MB, native Apple Silicon)
+- **TTS engine**: macOS `say` with the "Luciana (Premium)" voice
+- **Architecture**: single binary, client mode + daemon mode
+- **IPC**: UNIX socket at `~/.cache/agent-tts/sock`
+- **Queue**: SQLite WAL at `~/.cache/agent-tts/queue.db`
 - **Install path**: `/usr/local/bin/agent-tts`
 - **Auto-start**: `launchd` plist `~/Library/LaunchAgents/io.github.biliboss.agent-tts.plist`
 
-## Não fazer (docs)
+## Don't do (docs)
 
-- Não duplicar conteúdo entre páginas — linka
-- Não publicar externamente sem revisão de maintainer
-- Não embedar diagramas em imagem — usa code fence ASCII (busca + diff friendly)
-- Não inflar páginas com prosa decorativa — corta tudo que não move decisão
+- Don't duplicate content across pages — link instead
+- PRs must pass CI before merge
+- Don't embed diagrams as images — use ASCII code fences (searchable + diff-friendly)
+- Don't pad pages with decorative prose — cut anything that doesn't move a decision
 
-## Conexão com vault
+## Related
 
-- PARA entry: `03-projects/agent-tts.md`
-- Memória: `_memory/project-agent-tts.md`
-- Código (futuro): mesmo diretório, `src/main.zig` etc.
+- Live docs: https://biliboss.github.io/agent-tts/
+- Repo README: [`README.md`](./README.md)
+- Changelog: [`src/content/docs/changelog.md`](./src/content/docs/changelog.md)
 
-## Gotchas Starlight
+## Starlight gotchas
 
-- Starlight 0.30+ usa `social: {}` (não mais array)
-- MDX só na `.mdx` — markdown puro = `.md`. Mistura quebra
-- CustomCSS precisa estar em `src/styles/` e referenciado em `astro.config.mjs`
-- Sidebar `link` precisa de trailing slash (`/motor/` não `/motor`)
+- Starlight 0.30+ uses `social: {}` (no longer an array)
+- MDX only in `.mdx` — plain markdown = `.md`. Mixing breaks the build
+- CustomCSS must live in `src/styles/` and be referenced in `astro.config.mjs`
+- Sidebar `link` needs a trailing slash (`/motor/` not `/motor`)
