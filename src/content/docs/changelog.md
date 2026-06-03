@@ -9,6 +9,46 @@ Por marco: o que entregou, como medimos, o que ficou para o próximo. KPI único
 
 ---
 
+## v0.5 — preprocessor Pt-BR (cadência humana) · 2026-06-03
+
+**Entregue**:
+
+- `src/preproc.zig`: 3 transforms encadeados, single-pass por estágio, alocação via arena por mensagem
+  - Abreviações whole-word: `Sr. Sra. Dr. Dra. cf. etc. vs. nº Av. R$`
+  - Cardinais Pt-BR 0..9999 (state machine sobre dígitos; skipa se grudado em letra ou `%`; suporte a negativos `-5` → "menos cinco" e zero)
+  - Pausas `[[slnc N]]` para `,` (150ms), `.` `!` `?` (400ms), `\n` (600ms); pontuação consecutiva colapsa pra maior do grupo
+- Hook em `tts.zig`: `play()` roda o preproc antes do argv do `say`. Falha do preproc é não-fatal — log + fallback pro texto raw (best-effort, mensagem nunca cai)
+- Binary 459KB arm64 Mach-O (era 455KB em v0.2, +4KB pelo módulo)
+- `VERSION = "0.5.0"`, linha sobre "preprocessor active" no `--help`
+- 26 testes novos cobrindo cada transform + edge cases (empty, only-punct, mid-word não-match, out-of-range, mixed). `zig build test` = 27/27
+
+**Medições** (Mac Air M4, ReleaseFast, 1000 iter por caso, arena fresca por iter; baseline em `_qa/v0.5-baseline.md`):
+
+| Caso | input bytes | mediana | média |
+|------|-------------:|--------:|------:|
+| short greeting (`Olá, mundo.`) | 12 | 2.0 µs | 1.5 µs |
+| `Sr. Silva tem 25 anos, certo?` | 29 | 4.0 µs | 3.4 µs |
+| `Av. Paulista, nº 1578.` | 23 | 3.0 µs | 3.2 µs |
+| `Estamos em 2026 e devemos R$ 1234…` | 47 | 4.0 µs | 3.5 µs |
+| long mixed paragraph | 151 | 5.0 µs | 4.4 µs |
+
+Orçamento era < 1ms por mensagem; entregamos 200× abaixo. Zero risco de regressão TTFA.
+
+**Decisões honestas**:
+
+- `Sr.` consome o ponto (vira "Senhor", sem pausa subsequente). Tratado como abreviação, não terminador
+- `R$` é substituição cega, não reordena: `R$ 500` → "reais quinhentos" (não "quinhentos reais"). Suficiente até alguém reclamar
+- Connector "e" em milhares segue regra Pt-BR: `1500` = "mil e quinhentos", `1578` = "mil quinhentos e setenta e oito"
+- Cap em 9999 — números maiores ficam crus (`say` lê dígito-a-dígito)
+- Frações, horários (`14h30`), decimais ainda literais. YAGNI até demanda real
+
+**Não fechou nesta versão** (movido):
+
+- v0.3 (SQLite WAL + queue/skip/clear)
+- v0.4 (launchd auto-start)
+
+---
+
 ## Benchmark interlúdio · 2026-06-03
 
 Antes de codar v0.3, gastei uma sessão benchmarkando motores alternativos pra resolver code-switching Pt+En. Conclusões em [Motor TTS](/motor/). Resumo:

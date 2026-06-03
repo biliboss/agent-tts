@@ -1,4 +1,5 @@
-// agent-tts v0.2 — Pt-BR TTS via macOS `say`, with persistent daemon.
+// agent-tts v0.5 — Pt-BR TTS via macOS `say`, with persistent daemon
+// and Pt-BR text preprocessor (numbers, abbreviations, [[slnc N]] pauses).
 //
 // Entry point. Routes argv:
 //   agent-tts daemon         → daemon mode
@@ -20,7 +21,7 @@ const std = @import("std");
 const client = @import("client.zig");
 const daemon = @import("daemon.zig");
 
-pub const VERSION = "0.2.0";
+pub const VERSION = "0.5.0";
 
 const HELP =
     \\agent-tts v{s} — Pt-BR TTS via macOS `say`
@@ -37,7 +38,11 @@ const HELP =
     \\  -h, --help     this help
     \\  -V, --version  print version
     \\
-    \\v0.2 needs `agent-tts daemon` running in another terminal.
+    \\v0.5 ships the Pt-BR text preprocessor: abbreviations (Sr./Dr./Av./R$/…),
+    \\cardinal numbers 0..9999 (e.g. 2026 → "dois mil e vinte e seis"), and
+    \\[[slnc N]] pauses for commas, sentences and newlines. Cadência humana.
+    \\
+    \\v0.2+ needs `agent-tts daemon` running in another terminal.
     \\Auto-start arrives in v0.4 (launchd).
     \\
 ;
