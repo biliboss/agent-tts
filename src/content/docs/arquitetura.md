@@ -101,7 +101,7 @@ CREATE TABLE items (
 );
 ```
 
-Worker = a single thread loop. Never two synth/playback in parallel — overlap kills UX. Mutual exclusion is implicit from the single-consumer queue.
+Worker = a single thread loop. Never two synth/playback in parallel — overlap kills UX. Mutual exclusion is implicit from the single-consumer queue. Inside one piper item, v1.2 splits work across two cooperating threads (synth → audio) so long inputs don't pay full-input synth before first sample. The single-item invariant still holds: only one queue entry is ever in flight.
 
 Crash recovery on daemon boot: `UPDATE items SET state='pending' WHERE state='playing'` re-promotes orphan items from the previous run.
 
@@ -112,9 +112,21 @@ Selected per item via the `engine` column. The worker picks the matching path:
 | `item.engine` | Path |
 |---------------|------|
 | `say` | `tts.spawnSay(voice, rate, preprocessed_text)` → blocks on `wait()` |
-| `piper` | `PiperEngine.synthToSamples(text)` → `AudioPlayer.streamS16le(samples, 22050)` |
+| `piper` (1 chunk) | `PiperEngine.synthToSamples(text)` → `AudioPlayer.streamS16leAppend(samples, 22050)` (v0.7 fast path) |
+| `piper` (>1 chunk) | v1.2 pipeline: synth thread + audio thread + 2-slot bounded ring |
 
 If `--engine piper` arrives but the engine is not loaded (binary built without `-Dwith-piper=true`, or `AGENT_TTS_PIPER=1` was not set), the worker logs a warning and falls back to `say`.
+
+### Streaming pipeline (v1.2)
+
+For multi-sentence piper items, `runPiper` calls `preproc.chunkSentences` to split on `. ! ? \n` (abbreviation-aware: `Sr. Dr. Sra. Av. cf. etc. vs.` don't terminate). When chunk count is 1, the worker takes the v0.7 fast lane. When >1, it forks:
+
+- **Synth thread** — for each chunk, allocates a per-chunk arena off `std.heap.smp_allocator` (lock-free fast path), calls `engine.synthToSamples`, pushes the samples + arena into the ring. Blocks on a 2 ms nanosleep when the ring is full.
+- **Audio thread (= worker loop)** — pops from the ring, calls `AudioPlayer.streamS16leAppend`, deinits the chunk's arena. Blocks on 2 ms nanosleep when the ring is empty and synth hasn't closed it.
+- **Ring** — 2-slot SPSC, atomic `head` / `tail`. No `std.Thread.Mutex` (Zig 0.16 removed it; same `nanosleep` idiom already used in `audio.zig`).
+- **SKIP** — sets a `skip` flag the synth thread checks on every iteration; audio thread drains the ring and breaks.
+
+Result on a 490-word Pt-BR monologue: first-audio drops from ~3 s (v0.7 serial) to **~50 ms** (v1.2 streaming). Inter-chunk gap median is 0.02 ms with back-to-back `AudioBuffer + Sound` plays — well below one device period, so a custom `decoderReadProc` ring isn't needed today (deferred to v1.2.1 if a workload proves the gap audible).
 
 ### libpiper FFI
 
@@ -128,7 +140,7 @@ License: GPL-3.0-or-later. Built into the binary only when `-Dwith-piper=true`; 
 
 Vendored from [zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio). Linked against CoreAudio / AudioUnit / AudioToolbox frameworks on macOS. The daemon owns one `zaudio.Engine` instance.
 
-`AudioPlayer.streamS16le(samples, 22050)` creates an `AudioBuffer` data source pinned to the source rate (22050 Hz for Faber). Without the explicit sample rate, miniaudio upsamples to the device rate (48000 Hz) and pitch shifts ~2.18× higher — a fix shipped in v1.0.
+`AudioPlayer.streamS16le(samples, 22050)` creates an `AudioBuffer` data source pinned to the source rate (22050 Hz for Faber). Without the explicit sample rate, miniaudio upsamples to the device rate (48000 Hz) and pitch shifts ~2.18× higher — a fix shipped in v1.0. `streamS16leAppend` is the v1.2 alias used by the streaming worker; today it shares `streamS16le`'s body because measured inter-chunk gaps stay below one device period.
 
 ### Drive: `say` / `espeak-ng` / System.Speech
 

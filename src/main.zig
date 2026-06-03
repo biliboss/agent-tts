@@ -62,7 +62,9 @@ const HELP =
     \\                                                 (requires -Dwith-piper=true
     \\                                                  + AGENT_TTS_PIPER=1 on daemon)
     \\  agent-tts piper-test "texto" out.wav           synth one WAV (cold init)
-    \\  agent-tts ttfa-bench --engine say|piper --warm N  measure first-sample latency
+    \\  agent-tts ttfa-bench --engine say|piper --warm N [--input short|long]
+    \\                                                 measure first-sample latency
+    \\                                                 (--input long enables v1.2 streaming bench)
     \\
     \\Options:
     \\  --engine say|piper  TTS backend (default: piper; say = system fallback)
@@ -227,9 +229,10 @@ fn runTtfaBench(
     home: []const u8,
     args: []const []const u8,
 ) !void {
-    // Parse --engine and --warm flags.
+    // Parse --engine, --warm, --input flags.
     var engine: ipc.Engine = .say;
     var warm: u32 = 5;
+    var input_mode: InputMode = .short;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -253,6 +256,20 @@ fn runTtfaBench(
                 std.debug.print("error: --warm invalid (got '{s}')\n", .{args[i]});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, a, "--input")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --input needs value (short|long)\n", .{});
+                std.process.exit(2);
+            }
+            if (std.mem.eql(u8, args[i], "short")) {
+                input_mode = .short;
+            } else if (std.mem.eql(u8, args[i], "long")) {
+                input_mode = .long;
+            } else {
+                std.debug.print("error: --input must be short|long (got '{s}')\n", .{args[i]});
+                std.process.exit(2);
+            }
         }
     }
 
@@ -261,16 +278,52 @@ fn runTtfaBench(
         std.process.exit(2);
     }
 
-    const text = "Olá, este é um teste de latência.";
-
     // Engine-specific bench paths. Both report "TTFA real" — wall-clock time
     // from t0 (after init / pre-warm) to first audio frame entering the
     // device pump. For piper that's synth+zaudio start; for say it's the
     // round-trip until /usr/bin/say wakes up and starts pushing audio.
+    //
+    // v1.2: `--input long` routes piper through the streaming pipeline bench
+    // (sentence chunking + first-audio capture + inter-chunk gap stats). For
+    // `say` the long-input path falls back to the standard wall-time bench —
+    // streaming is a piper-only optimization (say is one-shot per spawn).
     switch (engine) {
-        .say => try benchSay(arena, io, warm, text),
-        .piper => try benchPiper(arena, io, home, warm, text),
+        .say => {
+            const text = if (input_mode == .long) try loadLongInput(arena, io) else "Olá, este é um teste de latência.";
+            try benchSay(arena, io, warm, text);
+        },
+        .piper => switch (input_mode) {
+            .short => try benchPiper(arena, io, home, warm, "Olá, este é um teste de latência."),
+            .long => {
+                const text = try loadLongInput(arena, io);
+                try benchPiperLong(arena, io, home, warm, text);
+            },
+        },
     }
+}
+
+const InputMode = enum { short, long };
+
+// Hardcoded fallback: short paragraph if `_qa/v1.2-long-input.txt` isn't
+// readable from cwd (e.g. binary invoked outside the repo). Long enough to
+// trigger multi-chunk streaming so the bench still produces meaningful
+// first-audio + gap numbers even without the file.
+const LONG_INPUT_FALLBACK =
+    \\Olá. Este é um teste do pipeline de streaming da versão 1.2.
+    \\O texto tem várias sentenças. Cada uma vira um chunk. O sintetizador roda em uma thread.
+    \\A engine de áudio toca em outra. O buffer entre as duas é pequeno. A primeira amostra sai cedo.
+    \\Esperamos que a latência do primeiro áudio caia para perto do tempo de síntese da primeira sentença.
+    \\No fluxo antigo, o usuário esperava o texto inteiro. Agora ouve quase que imediatamente.
+;
+
+fn loadLongInput(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const path = "_qa/v1.2-long-input.txt";
+    // 64 KB ceiling — long inputs are paragraphs, not novels.
+    const limit: std.Io.Limit = .limited(64 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, arena, limit) catch |e| {
+        std.debug.print("[ttfa-bench] long-input '{s}' unreadable ({s}), using inline fallback\n", .{ path, @errorName(e) });
+        return LONG_INPUT_FALLBACK;
+    };
 }
 
 fn benchSay(arena: std.mem.Allocator, io: std.Io, warm: u32, text: []const u8) !void {
@@ -389,6 +442,259 @@ fn benchPiper(
             avg,                               min_ms,
             max_ms,                            synth_avg,
             if (player.ready) "on" else "off",
+        },
+    );
+}
+
+// v1.2 long-input bench. Runs piper through the streaming pipeline (chunk →
+// synth thread → audio thread). Captures: first-audio latency (t0 → first
+// sample enters zaudio), total wall time, inter-chunk gap (median + max).
+//
+// "Inter-chunk gap" is the time between the end of chunk N's playback and
+// the start of chunk N+1's playback. With back-to-back AudioBuffer plays
+// that's bounded by the create/destroy cost of the next Sound — sub-ms on
+// M-class silicon, well under one device period.
+fn benchPiperLong(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    warm: u32,
+    text: []const u8,
+) !void {
+    if (!build_options.enabled) unreachable;
+    const piper = @import("piper.zig");
+    const preproc = @import("preproc.zig");
+
+    const voice_path = try std.fmt.allocPrint(
+        arena,
+        "{s}/.cache/agent-tts/voices/pt_BR-faber-medium.onnx",
+        .{home},
+    );
+    const espeak_data = "vendor/piper1-gpl/libpiper/dist/share/espeak-ng-data";
+
+    const t_init0 = std.Io.Clock.now(.awake, io);
+    var engine = try piper.PiperEngine.init(arena, voice_path, espeak_data);
+    defer engine.deinit();
+    const t_init1 = std.Io.Clock.now(.awake, io);
+    const init_ms = @as(f64, @floatFromInt(t_init1.nanoseconds - t_init0.nanoseconds)) / 1_000_000.0;
+
+    var player = audio.AudioPlayer.init(arena);
+    defer player.deinit();
+    if (!player.ready) {
+        std.debug.print("[ttfa-bench] zaudio init failed — long-input bench requires zaudio; aborting\n", .{});
+        return;
+    }
+
+    // Chunk the input once. Same path the daemon takes; chunk count drives
+    // the gap stats.
+    const chunks = try preproc.chunkSentences(arena, text);
+    std.debug.print("[ttfa-bench] long-input bytes={d} chunks={d}\n", .{ text.len, chunks.len });
+    if (chunks.len == 0) {
+        std.debug.print("[ttfa-bench] long-input produced 0 chunks — nothing to bench\n", .{});
+        return;
+    }
+
+    // Per-iteration result store. Keeps allocations off the hot loop.
+    const Result = struct {
+        first_audio_ms: f64,
+        total_ms: f64,
+        gap_median_ms: f64,
+        gap_max_ms: f64,
+        synth_total_ms: f64,
+    };
+    var results: std.ArrayList(Result) = .empty;
+    try results.ensureTotalCapacity(arena, warm);
+
+    var iter: u32 = 0;
+    while (iter < warm) : (iter += 1) {
+        // Single-producer / single-consumer ring with the same shape the
+        // daemon uses, but inlined here so the bench owns timing.
+        const RING_CAP: usize = 2;
+        const ChunkSlot = struct {
+            arena: ?std.heap.ArenaAllocator = null,
+            samples: []const i16 = &.{},
+            sample_rate: u32 = 0,
+            synth_err: bool = false,
+        };
+
+        var slots: [RING_CAP]ChunkSlot = [_]ChunkSlot{.{}} ** RING_CAP;
+        var head: std.atomic.Value(usize) = .init(0);
+        var tail: std.atomic.Value(usize) = .init(0);
+        var closed: std.atomic.Value(bool) = .init(false);
+
+        const Producer = struct {
+            engine: *piper.PiperEngine,
+            chunks: []const preproc.Chunk,
+            slots: *[RING_CAP]ChunkSlot,
+            head: *std.atomic.Value(usize),
+            tail: *std.atomic.Value(usize),
+            closed: *std.atomic.Value(bool),
+
+            fn run(p: @This()) void {
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+                for (p.chunks) |chunk| {
+                    // Wait for free slot.
+                    while (true) {
+                        const h = p.head.load(.acquire);
+                        const t = p.tail.load(.acquire);
+                        if (h - t < RING_CAP) break;
+                        _ = std.c.nanosleep(&ts, null);
+                    }
+                    const gpa = std.heap.smp_allocator;
+                    const arena_box = gpa.create(std.heap.ArenaAllocator) catch {
+                        const h2 = p.head.load(.acquire);
+                        p.slots[h2 % RING_CAP] = .{ .synth_err = true };
+                        p.head.store(h2 + 1, .release);
+                        continue;
+                    };
+                    arena_box.* = std.heap.ArenaAllocator.init(gpa);
+                    const samples = p.engine.synthToSamples(arena_box.allocator(), chunk.text) catch {
+                        arena_box.deinit();
+                        gpa.destroy(arena_box);
+                        const h2 = p.head.load(.acquire);
+                        p.slots[h2 % RING_CAP] = .{ .synth_err = true };
+                        p.head.store(h2 + 1, .release);
+                        continue;
+                    };
+                    const rate = p.engine.sampleRate();
+                    const h2 = p.head.load(.acquire);
+                    p.slots[h2 % RING_CAP] = .{
+                        .arena = arena_box.*,
+                        .samples = samples,
+                        .sample_rate = rate,
+                    };
+                    p.head.store(h2 + 1, .release);
+                    gpa.destroy(arena_box);
+                }
+                p.closed.store(true, .release);
+            }
+        };
+
+        var first_sample_ns: i128 = 0;
+        const FsCtx = struct {
+            ns: *i128,
+            io: std.Io,
+            fn cb(opaque_ctx: ?*anyopaque) void {
+                const c: *@This() = @ptrCast(@alignCast(opaque_ctx.?));
+                // Latch on first fire only — every chunk calls back after its
+                // sound.start(), but TTFA is the FIRST chunk's start time.
+                if (c.ns.* != 0) return;
+                const now = std.Io.Clock.now(.awake, c.io);
+                c.ns.* = now.nanoseconds;
+            }
+        };
+        var fs_ctx = FsCtx{ .ns = &first_sample_ns, .io = io };
+        player.on_first_sample = FsCtx.cb;
+        player.on_first_sample_ctx = @ptrCast(&fs_ctx);
+
+        // Per-chunk inter-arrival gaps. gap[N] = play_start[N] - play_end[N-1].
+        var gaps_ns: std.ArrayList(u64) = .empty;
+        try gaps_ns.ensureTotalCapacity(arena, chunks.len);
+
+        const producer_args = Producer{
+            .engine = &engine,
+            .chunks = chunks,
+            .slots = &slots,
+            .head = &head,
+            .tail = &tail,
+            .closed = &closed,
+        };
+
+        const t0 = std.Io.Clock.now(.awake, io);
+        const producer_thread = try std.Thread.spawn(.{}, Producer.run, .{producer_args});
+
+        var prev_play_end_ns: i128 = 0;
+        var played: usize = 0;
+        var total_samples: usize = 0;
+
+        const ts_pop: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        consumer: while (true) {
+            const h = head.load(.acquire);
+            const t = tail.load(.acquire);
+            if (h <= t) {
+                if (closed.load(.acquire)) break :consumer;
+                _ = std.c.nanosleep(&ts_pop, null);
+                continue;
+            }
+            var slot = slots[t % RING_CAP];
+            tail.store(t + 1, .release);
+
+            if (slot.synth_err) {
+                if (slot.arena) |*a| @constCast(a).deinit();
+                continue;
+            }
+
+            const t_play_start = std.Io.Clock.now(.awake, io);
+            if (prev_play_end_ns != 0) {
+                const gap: u64 = @intCast(t_play_start.nanoseconds - prev_play_end_ns);
+                try gaps_ns.append(arena, gap);
+            }
+
+            try player.streamS16leAppend(slot.samples, slot.sample_rate);
+            const t_play_end = std.Io.Clock.now(.awake, io);
+            prev_play_end_ns = t_play_end.nanoseconds;
+
+            played += 1;
+            total_samples += slot.samples.len;
+            if (slot.arena) |*a| @constCast(a).deinit();
+        }
+        producer_thread.join();
+        const t_end = std.Io.Clock.now(.awake, io);
+
+        const first_audio_ms = if (first_sample_ns > 0)
+            @as(f64, @floatFromInt(first_sample_ns - t0.nanoseconds)) / 1_000_000.0
+        else
+            0.0;
+        const total_ms = @as(f64, @floatFromInt(t_end.nanoseconds - t0.nanoseconds)) / 1_000_000.0;
+
+        // Median + max gap.
+        var gap_median_ms: f64 = 0;
+        var gap_max_ms: f64 = 0;
+        if (gaps_ns.items.len > 0) {
+            std.mem.sort(u64, gaps_ns.items, {}, std.sort.asc(u64));
+            const mid_ns = gaps_ns.items[gaps_ns.items.len / 2];
+            gap_median_ms = @as(f64, @floatFromInt(mid_ns)) / 1_000_000.0;
+            const max_ns = gaps_ns.items[gaps_ns.items.len - 1];
+            gap_max_ms = @as(f64, @floatFromInt(max_ns)) / 1_000_000.0;
+        }
+
+        try results.append(arena, .{
+            .first_audio_ms = first_audio_ms,
+            .total_ms = total_ms,
+            .gap_median_ms = gap_median_ms,
+            .gap_max_ms = gap_max_ms,
+            .synth_total_ms = 0.0, // synth runs on its own thread; not measured per-iter here
+        });
+
+        std.debug.print(
+            "[ttfa-bench] long iter={d}/{d} chunks={d} first_audio={d:.1}ms total={d:.1}ms gap_med={d:.2}ms gap_max={d:.2}ms samples={d}\n",
+            .{ iter + 1, warm, played, first_audio_ms, total_ms, gap_median_ms, gap_max_ms, total_samples },
+        );
+    }
+
+    // Aggregate.
+    var sum_first: f64 = 0;
+    var min_first: f64 = std.math.floatMax(f64);
+    var max_first: f64 = 0;
+    var sum_total: f64 = 0;
+    var sum_gap_med: f64 = 0;
+    var max_gap: f64 = 0;
+    for (results.items) |r| {
+        sum_first += r.first_audio_ms;
+        if (r.first_audio_ms < min_first) min_first = r.first_audio_ms;
+        if (r.first_audio_ms > max_first) max_first = r.first_audio_ms;
+        sum_total += r.total_ms;
+        sum_gap_med += r.gap_median_ms;
+        if (r.gap_max_ms > max_gap) max_gap = r.gap_max_ms;
+    }
+    const n_f: f64 = @floatFromInt(results.items.len);
+    std.debug.print(
+        "[ttfa-bench] engine=piper input=long warm={d} init={d:.1}ms first_audio avg={d:.1}ms min={d:.1}ms max={d:.1}ms total_avg={d:.1}ms gap_med_avg={d:.2}ms gap_max={d:.2}ms\n",
+        .{
+            warm,                          init_ms,
+            sum_first / n_f,               min_first,
+            max_first,                     sum_total / n_f,
+            sum_gap_med / n_f,             max_gap,
         },
     );
 }

@@ -72,6 +72,27 @@ pub const AudioPlayer = struct {
         self.stop_requested.store(true, .release);
     }
 
+    /// v1.2 streaming hint: same semantics as `streamS16le` — blocks until the
+    /// given chunk finishes playing (or `requestStop` fires). The daemon's
+    /// pipelined worker (synth-thread + audio-thread) calls this back-to-back
+    /// per chunk; the inter-chunk gap is bounded by the create/destroy cost
+    /// of the AudioBuffer + Sound pair (sub-millisecond on M-class silicon,
+    /// well under one device period).
+    ///
+    /// Why this isn't true gapless: miniaudio's `AudioBuffer` is a one-shot
+    /// data source. A truly seamless stream would require a custom
+    /// `decoderReadProc` reading from a ring buffer with the realtime
+    /// allocator constraint — see v1.2.1 in `whats-next.md`. The measured
+    /// gap with back-to-back AudioBuffer plays is small enough that it
+    /// doesn't move the long-input UX (first-audio latency dominates).
+    pub fn streamS16leAppend(
+        self: *AudioPlayer,
+        samples: []const i16,
+        sample_rate: u32,
+    ) Error!void {
+        return self.streamS16le(samples, sample_rate);
+    }
+
     /// Block until `samples` finishes playing or `requestStop` fires. The
     /// samples slice is consumed via an AudioBuffer wrapping it directly —
     /// caller must keep `samples` alive for the duration of this call.

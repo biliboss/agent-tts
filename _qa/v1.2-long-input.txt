@@ -1,0 +1,17 @@
+Olá. Este é um monólogo longo de teste para o ttfa-bench da versão 1.2 do agent-tts. O objetivo é medir a latência do primeiro áudio quando o pipeline de chunking por sentença está ativo.
+
+O caso de uso real é um agente que resume um diff grande, ou que lê uma decisão arquitetural escrita em Markdown. No fluxo antigo, o sintetizador rodava sobre o texto inteiro, e o ouvinte esperava pela síntese completa antes de ouvir a primeira amostra. Em entradas de quinhentas palavras isso significava esperar cerca de três segundos.
+
+A versão 1.2 muda esse comportamento. O pré-processador parte o texto em sentenças. A thread de síntese roda uma sentença à frente da thread de áudio. Um buffer pequeno entre as duas absorve variações de tamanho de sentença. Quando o usuário aperta skip, o pipeline drena rapidamente e a engine de áudio para.
+
+Para chegar até aqui foi preciso revisitar três arquivos. Primeiro, preproc.zig ganhou a função chunkSentences. Ela parte em ponto final, exclamação, interrogação e quebra de linha. Abreviações conhecidas, como Sr. Silva, Dr. Souza, Sra. Lima ou Av. Paulista, não terminam sentença. Reticências colapsam para um único corte. Pontuação combinada como interrogação seguida de exclamação preserva ambos os caracteres na sentença anterior.
+
+Segundo, daemon.zig ficou pipelined. A função runPiper detecta se há mais de um chunk e nesse caso dispara um worker de síntese em uma thread separada. O canal entre os dois é um ring buffer de duas posições, controlado por dois inteiros atômicos para head e tail. Sem mutex, porque a versão 0.16 do Zig removeu std.Thread.Mutex e nós já usamos o mesmo padrão de espera com nanosleep no AudioPlayer.
+
+Terceiro, audio.zig recebeu o método streamS16leAppend. Hoje ele é um alias do streamS16le clássico, mas o nome documenta o contrato pretendido: aceitar pedaços consecutivos sem reiniciar a engine. O caminho realmente gapless, com um data source customizado lendo de um ring de amostras, fica para a versão 1.2.1. O gap medido entre chunks back-to-back é pequeno o suficiente para não atrapalhar a experiência.
+
+O ganho prático é grande. Em entradas curtas, de uma sentença só, o pipeline detecta o caso trivial e vai pelo caminho rápido do v0.7, sem custo adicional. Em entradas longas, o ouvinte ouve a primeira sentença em torno de cem milissegundos depois do enqueue, e as sentenças seguintes encadeiam enquanto a síntese ainda está rodando.
+
+A medição que importa é simples. Pegamos o tempo do enqueue, marcamos o tempo quando a primeira amostra entra na engine de áudio, e calculamos a diferença. Esse número é publicado no changelog. Também medimos o tempo total da pipeline e a quantidade de amostras geradas, para confirmar que nenhum chunk foi descartado por engano.
+
+Encerrando, a versão 1.2 é uma vitória focada em latência percebida. Não muda o protocolo do daemon, não muda o esquema do banco, não adiciona dependências, e mantém o caminho do say intacto. Quem usa agente longo só ouve a diferença.

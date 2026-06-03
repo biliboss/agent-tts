@@ -1,30 +1,17 @@
 ---
 title: What's next
-description: Three next versions of agent-tts — streaming, voice cloning, and native Claude Code voice via MCP.
+description: Two next versions of agent-tts — voice cloning and native Claude Code voice via MCP.
 ---
 
 ## TL;DR
 
-v1.1 shipped multilingual code-switch (`MultiPiperEngine` + `--lang auto|pt|en` + En Amy voice routing). v1.3 shipped Linux espeak-ng + systemd + CI matrix. **What follows is about reach, not plumbing.** Three themes pulled out of the v1.1+v1.3 backlog and pointed at the audiences that will care.
+v1.1 shipped multilingual code-switch (`MultiPiperEngine` + `--lang auto|pt|en` + En Amy voice routing). v1.2 added sentence-streaming so long inputs hit first-audio in ~50 ms instead of ~3 s. v1.3 shipped Linux espeak-ng + systemd + CI matrix. **What follows is about reach, not plumbing.** Two themes pulled out of the v1.1+v1.2+v1.3 backlog and pointed at the audiences that will care.
 
 Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/agent-tts).
 
 ---
 
-## v1.2 — Streaming · *First word before the last is written*
-
-> Sub-100 ms warm synth is great for short messages. For a 500-word agent monologue, the user still waits ~3 s for the first sample. v1.2 fixes that.
-
-**The problem today.** Pre-processing + synth happen serially on the whole input. Long deploys, long reviews, long agent decisions all start late.
-
-**What ships.** Sentence-boundary chunking in `preproc.zig`. The worker dispatches chunk 1 to the engine while the preprocessor is still chewing chunk N. The audio queue stitches the PCM streams back-to-back via zaudio.
-
-**Why now.** zaudio already exposes the callback-driven path. The remaining work is preprocessor state, an internal chunk queue, and gapless playback hinting.
-
-**Who cares.**
-- Anyone who runs `agent-tts "$(cat huge-output.txt)"`.
-- Agents that summarize commits, PRs, or `git diff` outputs.
-- Accessibility users on dynamic feeds (notifications, transcripts).
+<!-- v1.1 multilingual shipped; v1.2 streaming shipped; v1.3 cross-platform shipped. See Changelog. -->
 
 ---
 
