@@ -20,6 +20,7 @@ const tts = @import("tts.zig");
 const Queue = @import("queue.zig").Queue;
 const queue_mod = @import("queue.zig");
 const audio = @import("audio.zig");
+const preproc = @import("preproc.zig");
 const build_options = @import("build_options");
 
 // Piper is only @imported when the build enables it — otherwise piper.h
@@ -192,24 +193,55 @@ fn runPiper(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.
     if (!build_options.enabled) unreachable;
     const engine = res.piper.?;
 
-    // Synth dominates short utterances on Faber-medium (~60-110ms on M4).
-    // Engine handle is single-writer because the worker is the only caller
-    // and we serialise playback by design.
-    const t_synth0 = std.Io.Clock.now(.awake, io);
-    const samples = engine.synthToSamples(sa, item.text) catch |e| {
+    // v1.2: chunk on sentence boundaries so long inputs can stream — the
+    // synth thread runs one chunk ahead of the audio thread. Single-chunk
+    // inputs (short messages, the common path) skip the pipeline overhead
+    // and take the v0.7 fast path below.
+    const chunks = preproc.chunkSentences(sa, item.text) catch |e| {
         res.queue.finishPlaying(io, item.id);
         return e;
     };
-    const t_synth1 = std.Io.Clock.now(.awake, io);
+
+    if (chunks.len == 0) {
+        res.queue.finishPlaying(io, item.id);
+        return;
+    }
 
     // SKIP routes through audio_player.requestStop for piper items; we
     // still register a sentinel PID so `agent-tts queue` shows "playing".
     res.queue.setPlaying(io, item.id, @intCast(std.c.getpid()));
 
+    if (chunks.len == 1) {
+        try runPiperSingle(res, io, sa, item, engine, chunks[0].text);
+        res.queue.finishPlaying(io, item.id);
+        return;
+    }
+
+    runPiperStreaming(res, io, sa, item, engine, chunks) catch |e| {
+        res.queue.finishPlaying(io, item.id);
+        return e;
+    };
+    res.queue.finishPlaying(io, item.id);
+}
+
+// v0.7 fast path — one synth, one play, no thread spawn.
+fn runPiperSingle(
+    res: *Resources,
+    io: std.Io,
+    sa: std.mem.Allocator,
+    item: queue_mod.PoppedItem,
+    engine: *piper_mod.PiperEngine,
+    text: []const u8,
+) !void {
+    if (!build_options.enabled) unreachable;
+    const t_synth0 = std.Io.Clock.now(.awake, io);
+    const samples = try engine.synthToSamples(sa, text);
+    const t_synth1 = std.Io.Clock.now(.awake, io);
+
     const sample_rate = engine.sampleRate();
     const t_play0 = std.Io.Clock.now(.awake, io);
     if (res.audio_player.ready) {
-        res.audio_player.streamS16le(samples, sample_rate) catch |e| {
+        res.audio_player.streamS16leAppend(samples, sample_rate) catch |e| {
             std.debug.print("[worker] zaudio play failed: {s} — falling back to afplay\n", .{@errorName(e)});
             try playViaAfplay(io, sa, samples, sample_rate);
         };
@@ -223,8 +255,211 @@ fn runPiper(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.
     std.debug.print("[worker] piper id={d} synth={d:.1}ms play={d:.1}ms samples={d}\n", .{
         item.id, synth_ms, play_ms, samples.len,
     });
+}
 
-    res.queue.finishPlaying(io, item.id);
+// ──────────────────────────────────────────────────────────────────────
+// v1.2 — pipelined synth + playback (single-producer / single-consumer)
+// ──────────────────────────────────────────────────────────────────────
+//
+// Bounded ring of 2-slot capacity: the synth thread is allowed exactly one
+// chunk ahead of the audio thread. Slot lifetime is owned by a per-chunk
+// arena allocated under the worker's GPA; the audio thread frees the
+// arena once playback returns (or fails). No std.Thread.Mutex (Zig 0.16
+// removed it) — atomic head/tail + 5ms nanosleep polling match audio.zig.
+
+const RING_CAP: usize = 2;
+
+const ChunkSlot = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    samples: []const i16 = &.{},
+    sample_rate: u32 = 0,
+    synth_err: bool = false,
+};
+
+const ChunkChannel = struct {
+    slots: [RING_CAP]ChunkSlot = [_]ChunkSlot{.{}} ** RING_CAP,
+    head: std.atomic.Value(usize) = .init(0), // next write index
+    tail: std.atomic.Value(usize) = .init(0), // next read index
+    closed: std.atomic.Value(bool) = .init(false),
+    skip: std.atomic.Value(bool) = .init(false),
+
+    fn pendingCount(self: *const ChunkChannel) usize {
+        const h = self.head.load(.acquire);
+        const t = self.tail.load(.acquire);
+        return h - t;
+    }
+
+    // Producer: block until there's a free slot OR consumer closed/skipped.
+    fn waitForSlot(self: *ChunkChannel) bool {
+        const ts: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        while (true) {
+            if (self.skip.load(.acquire)) return false;
+            if (self.pendingCount() < RING_CAP) return true;
+            _ = std.c.nanosleep(&ts, null);
+        }
+    }
+
+    fn push(self: *ChunkChannel, slot: ChunkSlot) void {
+        const h = self.head.load(.acquire);
+        self.slots[h % RING_CAP] = slot;
+        self.head.store(h + 1, .release);
+    }
+
+    // Consumer: block until there's a chunk OR producer signaled closed.
+    fn pop(self: *ChunkChannel) ?ChunkSlot {
+        const ts: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        while (true) {
+            if (self.skip.load(.acquire)) return null;
+            const h = self.head.load(.acquire);
+            const t = self.tail.load(.acquire);
+            if (h > t) {
+                const slot = self.slots[t % RING_CAP];
+                self.tail.store(t + 1, .release);
+                return slot;
+            }
+            if (self.closed.load(.acquire)) return null;
+            _ = std.c.nanosleep(&ts, null);
+        }
+    }
+};
+
+const SynthArgs = struct {
+    engine: *piper_mod.PiperEngine,
+    chunks: []const preproc.Chunk,
+    chan: *ChunkChannel,
+    gpa: std.mem.Allocator,
+};
+
+fn synthWorker(args: SynthArgs) void {
+    if (!build_options.enabled) unreachable;
+    for (args.chunks) |chunk| {
+        if (!args.chan.waitForSlot()) break;
+        // Per-chunk arena owns the synth output. Consumer frees on play
+        // completion. The arena lives on the heap so the slot can move
+        // through the ring without invalidating pointers.
+        const arena_box = args.gpa.create(std.heap.ArenaAllocator) catch {
+            args.chan.push(.{ .synth_err = true });
+            continue;
+        };
+        arena_box.* = std.heap.ArenaAllocator.init(args.gpa);
+        const samples = args.engine.synthToSamples(arena_box.allocator(), chunk.text) catch {
+            arena_box.deinit();
+            args.gpa.destroy(arena_box);
+            args.chan.push(.{ .synth_err = true });
+            continue;
+        };
+        const rate = args.engine.sampleRate();
+        args.chan.push(.{
+            .arena = arena_box.*,
+            .samples = samples,
+            .sample_rate = rate,
+        });
+        // Transfer ownership of the heap box: the consumer's slot copy
+        // carries the arena state. We free the *outer* pointer here; the
+        // arena state itself lives on inside the slot until consumer
+        // deinits it. (ArenaAllocator is a value type whose internals
+        // are heap-backed, so this copy is safe.)
+        args.gpa.destroy(arena_box);
+    }
+    args.chan.closed.store(true, .release);
+}
+
+fn runPiperStreaming(
+    res: *Resources,
+    io: std.Io,
+    sa: std.mem.Allocator,
+    item: queue_mod.PoppedItem,
+    engine: *piper_mod.PiperEngine,
+    chunks: []const preproc.Chunk,
+) !void {
+    if (!build_options.enabled) unreachable;
+    _ = sa;
+    var chan = ChunkChannel{};
+
+    // Streaming pipeline allocates per-chunk arenas off a thread-safe
+    // allocator (smp_allocator is per-CPU, lock-free fast path) so the
+    // synth thread and the worker thread don't contend on a debug GPA.
+    const gpa = std.heap.smp_allocator;
+
+    const args = SynthArgs{
+        .engine = engine,
+        .chunks = chunks,
+        .chan = &chan,
+        .gpa = gpa,
+    };
+    const synth_thread = try std.Thread.spawn(.{}, synthWorker, .{args});
+
+    const t_pipeline0 = std.Io.Clock.now(.awake, io);
+    var first_play_started: bool = false;
+    var t_first_audio_ns: i128 = 0;
+    var played_chunks: usize = 0;
+    var total_samples: usize = 0;
+
+    while (chan.pop()) |slot_const| {
+        var slot = slot_const;
+        if (slot.synth_err) {
+            if (slot.arena) |*a| @constCast(a).deinit();
+            std.debug.print("[worker] piper id={d} streaming synth error on chunk {d}\n", .{ item.id, played_chunks });
+            continue;
+        }
+
+        if (!first_play_started) {
+            const t_first = std.Io.Clock.now(.awake, io);
+            t_first_audio_ns = t_first.nanoseconds;
+            first_play_started = true;
+        }
+
+        const play_res = if (res.audio_player.ready) blk: {
+            break :blk res.audio_player.streamS16leAppend(slot.samples, slot.sample_rate);
+        } else blk: {
+            // afplay fallback needs a short-lived arena for the tmp WAV path.
+            var fb_arena = std.heap.ArenaAllocator.init(gpa);
+            defer fb_arena.deinit();
+            break :blk playViaAfplay(io, fb_arena.allocator(), slot.samples, slot.sample_rate);
+        };
+
+        played_chunks += 1;
+        total_samples += slot.samples.len;
+
+        if (slot.arena) |*a| @constCast(a).deinit();
+
+        // SKIP between chunks: streamS16le honors requestStop within the
+        // active chunk; we also bail the rest of the pipeline so the
+        // synth thread doesn't keep working on bytes the user wants gone.
+        if (res.audio_player.stop_requested.load(.acquire)) {
+            chan.skip.store(true, .release);
+            while (chan.pop()) |drain_const| {
+                var d = drain_const;
+                if (d.arena) |*a| @constCast(a).deinit();
+            }
+            break;
+        }
+
+        play_res catch |e| {
+            std.debug.print("[worker] piper id={d} streaming play error on chunk {d}: {s}\n", .{ item.id, played_chunks, @errorName(e) });
+            // Signal synth to bail; drain remaining slots' arenas.
+            chan.skip.store(true, .release);
+            while (chan.pop()) |drain_const| {
+                var d = drain_const;
+                if (d.arena) |*a| @constCast(a).deinit();
+            }
+            synth_thread.join();
+            return e;
+        };
+    }
+
+    synth_thread.join();
+
+    const t_pipeline1 = std.Io.Clock.now(.awake, io);
+    if (first_play_started) {
+        const first_audio_ms = @as(f64, @floatFromInt(t_first_audio_ns - t_pipeline0.nanoseconds)) / 1_000_000.0;
+        const total_ms = @as(f64, @floatFromInt(t_pipeline1.nanoseconds - t_pipeline0.nanoseconds)) / 1_000_000.0;
+        std.debug.print("[worker] piper id={d} streaming chunks={d} first_audio={d:.1}ms total={d:.1}ms samples={d}\n", .{
+            item.id, played_chunks, first_audio_ms, total_ms, total_samples,
+        });
+    } else {
+        std.debug.print("[worker] piper id={d} streaming produced no audio\n", .{item.id});
+    }
 }
 
 // Last-resort playback when zaudio.Engine isn't ready (headless CI, audio

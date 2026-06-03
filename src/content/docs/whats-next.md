@@ -5,7 +5,7 @@ description: Five next versions of agent-tts — multilingual, streaming, cross-
 
 ## TL;DR
 
-v1.0 shipped the runtime: single binary, neural Pt-BR by default, persistent queue, launchd auto-start, sub-100 ms warm synth. **What follows is about reach, not plumbing.** Five themes pulled out of the v1.0 backlog and pointed at the audiences that will care.
+v1.0 shipped the runtime: single binary, neural Pt-BR by default, persistent queue, launchd auto-start, sub-100 ms warm synth. v1.2 added sentence-streaming so long inputs hit first-audio in ~50 ms instead of ~3 s. **What follows is about reach, not plumbing.** Four themes pulled out of the v1.0 backlog and pointed at the audiences that will care.
 
 Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/agent-tts).
 
@@ -25,23 +25,6 @@ Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/ag
 - Brazilian devs working on English-named tools (everyone).
 - International audiences for screencasts and demos.
 - Accessibility users mixing languages naturally.
-
----
-
-## v1.2 — Streaming · *First word before the last is written*
-
-> Sub-100 ms warm synth is great for short messages. For a 500-word agent monologue, the user still waits ~3 s for the first sample. v1.2 fixes that.
-
-**The problem today.** Pre-processing + synth happen serially on the whole input. Long deploys, long reviews, long agent decisions all start late.
-
-**What ships.** Sentence-boundary chunking in `preproc.zig`. The worker dispatches chunk 1 to the engine while the preprocessor is still chewing chunk N. The audio queue stitches the PCM streams back-to-back via zaudio.
-
-**Why now.** zaudio already exposes the callback-driven path. The remaining work is preprocessor state, an internal chunk queue, and gapless playback hinting.
-
-**Who cares.**
-- Anyone who runs `agent-tts "$(cat huge-output.txt)"`.
-- Agents that summarize commits, PRs, or `git diff` outputs.
-- Accessibility users on dynamic feeds (notifications, transcripts).
 
 ---
 

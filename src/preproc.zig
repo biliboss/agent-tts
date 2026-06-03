@@ -20,6 +20,13 @@ pub const Pause = struct {
     pub const NEWLINE_MS: u32 = 600;
 };
 
+/// One unit of work for the v1.2 streaming pipeline. Bytes are sliced from
+/// the caller's input (or arena-duped on edge cases); the caller's arena
+/// owns the underlying memory.
+pub const Chunk = struct {
+    text: []const u8,
+};
+
 const Abbrev = struct {
     src: []const u8,
     dst: []const u8,
@@ -347,6 +354,113 @@ fn insertPauses(arena: std.mem.Allocator, input: []const u8) ![]u8 {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// v1.2 — sentence chunking for streaming
+// ──────────────────────────────────────────────────────────────────────
+//
+// `chunkSentences` splits raw input into Chunks on `.`, `!`, `?`, `\n`.
+// Punctuation stays attached to the preceding chunk; newline is dropped
+// (its semantic pause comes back when `process` runs on the chunk).
+//
+// Abbreviation guard: a `.` that closes an entry in ABBREVS (e.g. `Sr.`,
+// `Dr.`, `Sra.`, `Av.`) does NOT terminate. Mirrors the same list used by
+// `expandAbbreviations`, so the streaming path can't introduce a split
+// the non-streaming path wouldn't honor. Lower-case-only abbreviations
+// like `cf.`, `etc.`, `vs.` are also guarded.
+//
+// Leading/trailing whitespace per chunk is trimmed. Empty chunks dropped.
+//
+// Returns a slice of Chunks owned by `arena`. Each chunk's `text` field
+// is a subslice of `text` (no copy) — caller must keep `text` alive for
+// the chunks' lifetime.
+//
+// Known v1.2 corner cases (documented in whats-next.md for v1.2.1):
+//   - Decimals like "3.14" — the `.` is treated as a terminator. Acceptable
+//     because preproc's number stage doesn't handle decimals either.
+//   - Ellipsis "..." — collapses to a single chunk break (multiple `.`s
+//     in a row yield one split, not three).
+
+fn isAbbrevDotAt(input: []const u8, dot_idx: usize) bool {
+    // Check whether input[dot_idx] == '.' is the terminating dot of any
+    // entry in ABBREVS. Boundary rule mirrors expandAbbreviations: the
+    // entry must start at a word boundary.
+    if (dot_idx >= input.len or input[dot_idx] != '.') return false;
+    for (ABBREVS) |ab| {
+        if (ab.src.len == 0 or ab.src[ab.src.len - 1] != '.') continue;
+        if (ab.src.len > dot_idx + 1) continue;
+        const start = dot_idx + 1 - ab.src.len;
+        if (!std.mem.eql(u8, input[start .. dot_idx + 1], ab.src)) continue;
+        const at_word_start = (start == 0) or !isWordByte(input[start - 1]);
+        if (at_word_start) return true;
+    }
+    return false;
+}
+
+fn isTerminator(c: u8) bool {
+    return c == '.' or c == '!' or c == '?' or c == '\n';
+}
+
+/// Returns a freshly allocated slice of Chunks (in `arena`). Single
+/// sentence with no terminator → one chunk. Empty input → empty slice.
+/// Punctuation attaches to the preceding chunk; newlines are dropped.
+pub fn chunkSentences(arena: std.mem.Allocator, text: []const u8) ![]Chunk {
+    var out: std.ArrayList(Chunk) = .empty;
+    if (text.len == 0) return out.toOwnedSlice(arena);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (!isTerminator(c)) continue;
+        // Abbreviation-aware: skip `.` that closes Sr./Dr./etc.
+        if (c == '.' and isAbbrevDotAt(text, i)) continue;
+
+        // Extend the run over any consecutive trailing terminators so an
+        // ellipsis "..." or a "?!" combo emits a single chunk break.
+        var j = i + 1;
+        while (j < text.len and isTerminator(text[j])) : (j += 1) {}
+
+        // `end_attached` = end of the chunk INCLUDING the run of
+        // non-newline punctuation, EXCLUDING any '\n' bytes (we drop
+        // newlines on emit — the pause stage will reinsert their slnc).
+        var end_attached = i;
+        var k = i;
+        while (k < j) : (k += 1) {
+            if (text[k] != '\n') end_attached = k;
+        }
+        // If the run was newline-only, the chunk closes at i-1 (i.e.
+        // strip the newline entirely). Otherwise include up to the last
+        // non-newline terminator.
+        const run_has_punct = blk: {
+            var m = i;
+            while (m < j) : (m += 1) if (text[m] != '\n') break :blk true;
+            break :blk false;
+        };
+
+        const slice_end: usize = if (run_has_punct) end_attached + 1 else i;
+        const raw = trimChunk(text[start..slice_end]);
+        if (raw.len != 0) try out.append(arena, .{ .text = raw });
+
+        start = j;
+        i = j - 1; // loop will i+=1 → j
+    }
+
+    if (start < text.len) {
+        const raw = trimChunk(text[start..]);
+        if (raw.len != 0) try out.append(arena, .{ .text = raw });
+    }
+
+    return out.toOwnedSlice(arena);
+}
+
+fn trimChunk(s: []const u8) []const u8 {
+    var lo: usize = 0;
+    var hi: usize = s.len;
+    while (lo < hi and (s[lo] == ' ' or s[lo] == '\t' or s[lo] == '\n' or s[lo] == '\r')) lo += 1;
+    while (hi > lo and (s[hi - 1] == ' ' or s[hi - 1] == '\t' or s[hi - 1] == '\n' or s[hi - 1] == '\r')) hi -= 1;
+    return s[lo..hi];
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
@@ -483,4 +597,81 @@ test "out of range 0..9999 leaves raw" {
 
 test "leading number" {
     try runProcess("7 anões", "sete anões");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// v1.2 chunking tests
+// ──────────────────────────────────────────────────────────────────────
+
+fn expectChunks(input: []const u8, expected: []const []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try chunkSentences(arena, input);
+    testing.expectEqual(expected.len, got.len) catch |e| {
+        std.debug.print("\ninput: '{s}'\nexpected {d} chunks, got {d}:\n", .{ input, expected.len, got.len });
+        for (got) |ch| std.debug.print("  '{s}'\n", .{ch.text});
+        return e;
+    };
+    for (expected, got) |want, have| {
+        testing.expectEqualStrings(want, have.text) catch |e| {
+            std.debug.print("\ninput: '{s}'\n", .{input});
+            return e;
+        };
+    }
+}
+
+test "chunk single sentence no terminator" {
+    try expectChunks("Olá mundo", &.{"Olá mundo"});
+}
+
+test "chunk single sentence with period" {
+    try expectChunks("Olá mundo.", &.{"Olá mundo."});
+}
+
+test "chunk multi sentence" {
+    try expectChunks("Um. Dois. Três.", &.{ "Um.", "Dois.", "Três." });
+}
+
+test "chunk multi sentence mixed terminators" {
+    try expectChunks("Vai? Vai! Vai.", &.{ "Vai?", "Vai!", "Vai." });
+}
+
+test "chunk trailing whitespace" {
+    try expectChunks("Um.   Dois.  ", &.{ "Um.", "Dois." });
+}
+
+test "chunk newlines split" {
+    try expectChunks("linha 1\nlinha 2", &.{ "linha 1", "linha 2" });
+}
+
+test "chunk only newlines yields empty" {
+    try expectChunks("\n\n\n", &.{});
+}
+
+test "chunk empty input yields empty" {
+    try expectChunks("", &.{});
+}
+
+test "chunk abbreviation Sr. does not split" {
+    try expectChunks("Sr. Silva chegou. Boa tarde.", &.{ "Sr. Silva chegou.", "Boa tarde." });
+}
+
+test "chunk abbreviation Dr. Sra. Av. do not split" {
+    try expectChunks(
+        "Dr. Souza encontrou Sra. Lima na Av. Paulista.",
+        &.{"Dr. Souza encontrou Sra. Lima na Av. Paulista."},
+    );
+}
+
+test "chunk ellipsis collapses to one split" {
+    try expectChunks("hmm... ok.", &.{ "hmm...", "ok." });
+}
+
+test "chunk newline after punctuation drops the newline" {
+    try expectChunks("Um.\nDois.", &.{ "Um.", "Dois." });
+}
+
+test "chunk preserves combined punctuation" {
+    try expectChunks("Sério?! Mesmo!?", &.{ "Sério?!", "Mesmo!?" });
 }
