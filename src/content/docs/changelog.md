@@ -9,6 +9,76 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.7 — Streaming text input · 2026-06-03
+
+**Shipped**:
+
+- `src/preproc.zig` — new `IncrementalChunker` state machine. Caller owns one instance + a long-lived arena; `feed(arena, bytes) → []Chunk` appends bytes to the internal buffer, scans for sentence boundaries from a `scan_idx` cursor (O(1) amortized per byte), emits completed sentences with the bytes dup'd into the caller's arena. `flush(arena)` drains the remainder at EOF. Same abbreviation list as `chunkSentences` (`Sr./Dr./Sra./Dra./Av./cf./etc./vs.`) so the streaming path can't split a token the batch path wouldn't. Eager-emit policy: a terminator-run touching end-of-buffer emits anyway — splitting an ellipsis across packet boundaries is the accepted trade-off for low-latency voice
+- `src/stream.zig` — new `agent-tts stream [--engine X] [--voice V] [--rate R]` subcommand. Reads stdin via `readSliceShort` (no '\n' assumption — LLM streams ship partial tokens), feeds each read into the chunker, forwards each emitted sentence to the running daemon via `client.enqueueLine` (the same helper the MCP server uses). One diagnostic per chunk to stderr (`[stream] enqueued id=N text='…'`). EOF triggers `flush` then exits 0
+- `src/mcp.zig` — new tool `say_stream(stream_id, chunk, final?)`. Per-stream state lives in a process-scoped `StringHashMapUnmanaged(StreamSession)` keyed by caller-chosen `stream_id`. Each session owns an `IncrementalChunker` + its own gpa-backed `ArenaAllocator` so the buffer survives across per-request arenas. `final=true` flushes and drops the session. Tools list grows from 5 → 6
+- `src/main.zig` — dispatches `stream` to `stream.run`; HELP gains the new lines; `VERSION = "1.7.0"`. `ttfa-bench --input stream` simulates token-by-token feed (10 ms inter-token gap, tokens split on whitespace with trailing ws preserved) and measures *time from first token-in to first audio-out* through the real synth + zaudio pipeline
+- `build.zig` / `build.zig.zon` — `.version = "1.7.0"`; new `addTest` step for `src/stream.zig`
+
+**Measurements** (Mac Air M4, ReleaseFast, libpiper OFF for the host build; OFF for tests, ON for the stream bench):
+
+| Metric | Value | v1.7 target |
+|---|---|---|
+| `zig build` (Debug, host arm64) | clean | clean ✅ |
+| `zig build test --summary all` | **166/166** (up from 40/40 at v1.4 + 5 mcp at v1.5) | all green ✅ |
+| New `IncrementalChunker` tests | 9 (single-feed, split-feeds, byte-by-byte, abbrev, ellipsis, newline, flush empty, multi-sentence, no-boundary) | green ✅ |
+| New `mcp.say_stream` tool listed in `tools/list` | yes (6 tools total) | listed ✅ |
+| End-to-end MCP `say_stream` against warm daemon | "Hello. Wor" + "ld." (final=true) → 2 chunks enqueued ("Hello." + "World.") | works ✅ |
+| End-to-end CLI `echo "Olá. Tudo bem?" \| agent-tts stream` | 2 chunks enqueued, exit 0 | works ✅ |
+| `ttfa-bench --engine piper --input stream` first-audio | informational — requires libpiper build, not captured this run | informational |
+
+**Honest scope**:
+
+- The latency table for `ttfa-bench --input stream` is not pre-populated in the changelog. The bench is wired (loads `_qa/v1.2-long-input.txt`, tokenises on whitespace with 10 ms gaps, drives the synth+audio pipeline, captures first-audio relative to `t0=first-token-in`), but `libpiper.dylib` was not rebuilt in this session — the number will live in `_qa/v1.7-baseline.md` once captured against the v1.6 piper environment. Expected envelope: ≤ first-chunk synth time (~90 ms warm) + one token gap. The streaming UX wins because audio starts on the FIRST emitted sentence, not when the agent finishes generating
+- **Stream session collisions across MCP clients** are caller's responsibility. The hashmap is process-scoped; a `stream_id="x"` from two different agents sharing one `agent-tts mcp` process will alias each other's buffer. Treat `stream_id` like a UUID. Documented in the tool schema
+- **No persistence across daemon restart.** A stream open at the moment the `agent-tts mcp` process dies is gone — the chunker state lives in process memory only. Acceptable: agents already have to handle "MCP server restart" anyway
+- **Engine/voice/rate are per-call, not per-stream.** The schema invites the caller to set them on the first call; the implementation reads them from each call. This is consistent with the rest of the MCP tools (no hidden state) but means a caller could switch engine mid-stream. Future v1.7.1 may lock the choice on first call if real usage shows the foot-gun
+
+**Wire shape — CLI**:
+
+```bash
+$ claude --output-format stream-text "explain this codebase" | agent-tts stream
+[stream] enqueued id=42 text='Vou começar pela estrutura.'
+[stream] enqueued id=43 text='A pasta `src/` tem três módulos principais.'
+[stream] enqueued id=44 text='…'
+[stream] EOF — 8 chunk(s) enqueued
+```
+
+**Wire shape — MCP** (one `say_stream` call per assistant token delta):
+
+```jsonc
+// First delta:
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+  "name":"say_stream",
+  "arguments":{"stream_id":"reply-2026-06-03-001","chunk":"Vou começar"}}}
+// → {"result":{"content":[{"type":"text","text":"{\"enqueued_count\":0,\"final\":false}"}]}}
+
+// Many deltas later, the assistant emits "...estrutura. A pasta..." — the
+// `.` triggers an emit. enqueued_count jumps to 1 on that call.
+
+// Final delta:
+{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{
+  "name":"say_stream",
+  "arguments":{"stream_id":"reply-2026-06-03-001","chunk":"","final":true}}}
+// → flushes any tail, drops the session.
+```
+
+### Lead time
+
+| Marker | Timestamp | Δ from dispatch |
+|---|---|---|
+| dispatch_ts (parent) | 2026-06-03 22:52:11 UTC | 0 |
+| agent_start_ts | see `_qa/v1.7-leadtime.md` | first Bash call after dispatch |
+| commit_ts | see `_qa/v1.7-leadtime.md` | final action |
+
+Captured per the same v1.6 protocol for cross-agent comparison.
+
+---
+
 ## v1.5 — MCP server · 2026-06-03
 
 **Shipped**:
