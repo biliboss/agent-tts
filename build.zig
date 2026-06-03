@@ -141,12 +141,45 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Dedicated test target for the preprocessor (v0.5). Zig's addTest
+    // only collects tests from the file you point it to, not from its
+    // imports — so each test-bearing file gets its own step.
+    const preproc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/preproc.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_preproc_tests = b.addRunArtifact(preproc_tests);
+
+    // Benchmark executable for the preprocessor (used to populate
+    // _qa/v0.5-baseline.md). Build in ReleaseFast for realistic numbers.
+    const preproc_mod = b.createModule(.{
+        .root_source_file = b.path("src/preproc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "bench-preproc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_preproc.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "preproc", .module = preproc_mod }},
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench-preproc", "Run preproc benchmark");
+    bench_step.dependOn(&run_bench.step);
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_preproc_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

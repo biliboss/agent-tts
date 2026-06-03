@@ -1,9 +1,14 @@
-// Drives macOS `say`. v0.3 splits spawn from wait so the daemon worker can
+// Drives macOS `say`. The daemon worker calls `spawnSay` (v0.3) so it can
 // register the child PID with the queue (for SKIP → SIGTERM) before blocking
 // on wait().
+//
+// v0.5: text is run through `preproc.process` before being handed to `say`
+// (Pt-BR abbreviations, cardinal numbers, [[slnc N]] pauses). Failure of
+// the preprocessor is non-fatal — we log and fall back to the raw text.
 
 const std = @import("std");
 const ipc = @import("ipc.zig");
+const preproc = @import("preproc.zig");
 
 pub const SAY_PATH = "/usr/bin/say";
 
@@ -14,13 +19,19 @@ pub const Spawned = struct {
 
 pub fn spawnSay(arena: std.mem.Allocator, io: std.Io, voice: []const u8, rate: u32, text: []const u8) !Spawned {
     const rate_str = try std.fmt.allocPrint(arena, "{d}", .{rate});
+
+    const spoken: []const u8 = preproc.process(arena, text) catch |e| blk: {
+        std.debug.print("[tts] preproc failed ({s}); falling back to raw text\n", .{@errorName(e)});
+        break :blk text;
+    };
+
     const argv = [_][]const u8{
         SAY_PATH,
         "-v",
         voice,
         "-r",
         rate_str,
-        text,
+        spoken,
     };
     const child = try std.process.spawn(io, .{
         .argv = &argv,

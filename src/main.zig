@@ -1,4 +1,5 @@
-// agent-tts v0.3 — Pt-BR TTS via macOS `say`, persistent daemon, SQLite WAL queue.
+// agent-tts — Pt-BR TTS via macOS `say`, persistent daemon, SQLite WAL queue,
+// Pt-BR text preprocessor (numbers, abbreviations, [[slnc N]] pauses).
 //
 // Entry point. Routes argv:
 //   agent-tts daemon         → daemon mode
@@ -9,11 +10,6 @@
 //   agent-tts -V | --version → version
 //   agent-tts ...            → client: enqueue text on running daemon
 //
-// v0.3 scope locked by docs/roadmap.md:
-//   - SQLite WAL queue at ~/.cache/agent-tts/queue.db (survives crash/reboot)
-//   - QUEUE/SKIP/CLEAR ops over UNIX socket
-//   - Worker rewrite: drains via SQLite, registers child PID for SKIP-kill
-//
 // KPI = time-to-first-audio (TTFA). Client measures round-trip ACK; real TTFA
 // still needs dtruss + audio capture (roadmap _qa/).
 
@@ -22,7 +18,7 @@ const std = @import("std");
 const client = @import("client.zig");
 const daemon = @import("daemon.zig");
 
-pub const VERSION = "0.3.0";
+pub const VERSION = "0.5.0";
 
 const HELP =
     \\agent-tts v{s} — Pt-BR TTS via macOS `say`
@@ -42,7 +38,11 @@ const HELP =
     \\  -h, --help     this help
     \\  -V, --version  print version
     \\
-    \\v0.3 needs `agent-tts daemon` running in another terminal.
+    \\v0.5 ships the Pt-BR text preprocessor: abbreviations (Sr./Dr./Av./R$/…),
+    \\cardinal numbers 0..9999 (e.g. 2026 → "dois mil e vinte e seis"), and
+    \\[[slnc N]] pauses for commas, sentences and newlines. Cadência humana.
+    \\
+    \\v0.2+ needs `agent-tts daemon` running in another terminal.
     \\Auto-start arrives in v0.4 (launchd).
     \\
 ;
