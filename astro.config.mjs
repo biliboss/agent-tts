@@ -14,6 +14,11 @@ export default defineConfig({
     starlight({
       title: 'agent-tts',
       description: 'Global Zig CLI for Pt-BR TTS on macOS. KPI: time-to-first-audio.',
+      logo: {
+        src: './public/logos/agent-tts-logo.png',
+        replacesTitle: false,
+      },
+      favicon: '/favicon.ico',
       customCss: ['./src/styles/custom.css'],
       social: {
         github: 'https://github.com/biliboss/agent-tts',

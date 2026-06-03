@@ -1,64 +1,84 @@
 ---
 title: agent-tts
-description: Global Zig CLI for Pt-BR TTS on macOS — one KPI, time-to-first-audio.
+description: Give your AI agents a voice. Zig CLI for Pt-BR neural TTS on macOS — fast cold start, persistent queue, one binary.
 template: splash
 hero:
-  tagline: "Text in. Voice out. One KPI: time-to-first-audio."
+  image:
+    file: ../../../public/logos/agent-tts-logo.png
+  tagline: "Give your AI agents a voice. Neural Pt-BR TTS on macOS, one Zig binary, ~90ms warm synth."
   actions:
+    - text: Install
+      link: https://github.com/biliboss/agent-tts#install
+      icon: rocket
+      variant: primary
     - text: Architecture
       link: /agent-tts/arquitetura/
       icon: right-arrow
-      variant: primary
-    - text: TTS engine
-      link: /agent-tts/motor/
+      variant: secondary
+    - text: GitHub
+      link: https://github.com/biliboss/agent-tts
       icon: external
+      variant: minimal
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-## North star
+## Why agent-tts
 
-**Time-to-first-audio (TTFA)**: the gap between calling `agent-tts "text"` and the first audible sample at the speaker.
-
-v1.0 target on Mac Air M4: **< 300ms** with a warm daemon cache. Every stack choice is justified against that number.
-
-| Scenario | TTFA target |
-|---------|-----------|
-| Warm daemon, voice already loaded | < 300ms |
-| First call after boot (cold) | < 800ms |
-| Long text (>500 chars) — first chunk | < 400ms |
-
-## Why it exists
-
-Agents (Claude Code, local CI scripts, watchers) need to speak updates without stealing visual focus. Pop-ups interrupt, terminal scroll is silent, notifications disappear. Voice fills the whole audio channel and keeps your hands free.
-
-Planned commands:
+Your agents already write, build, deploy, and review. They should also **talk** — without stealing focus, without a Python venv, without paying ElevenLabs per token.
 
 ```bash
-agent-tts "Build green in 12s."
-agent-tts --rate 200 "Fast text."
-echo "stdin too" | agent-tts -
-agent-tts queue           # list pending
-agent-tts skip            # skip current item
+agent-tts "Build green in 12 seconds."
+agent-tts --engine piper "Deploy concluído, três warnings."
+agent-tts queue       # list what is pending
+agent-tts skip        # kill current
 ```
+
+| | agent-tts | macOS `say` | Piper (Python) | ElevenLabs |
+|---|---|---|---|---|
+| Warm synth latency | **~91ms** | n/a | 200-300ms | 200-800ms + network |
+| Cold daemon boot | **~720ms** | 0 per call | 1-3s | 0 |
+| Persistent queue | ✅ SQLite WAL | ❌ | ❌ | ❌ |
+| Skip / clear / list | ✅ | ❌ | ❌ | n/a |
+| Auto-start | ✅ launchd | n/a | manual | n/a |
+| Single binary | ✅ ~975 KB | n/a | ❌ Python venv | ❌ |
+| Offline | ✅ | ✅ | ✅ | ❌ |
+| Cost per message | $0 | $0 | $0 | $$$ |
+
+## One KPI: time-to-first-audio
+
+Everything is benchmarked against the gap between calling `agent-tts "text"` and the first audible sample.
+
+| Scenario | Target | Measured |
+|---|---|---|
+| Warm daemon, voice loaded | **< 300ms** | round-trip 0.1ms + synth 91ms |
+| First call after boot (cold) | < 800ms | pre-warm 280ms + zaudio 79ms + piper 373ms |
+| Long text — first chunk | < 400ms | (v1.1) |
 
 <CardGrid>
   <Card title="Architecture" icon="setting">
-    Zig + daemon + UNIX socket + SQLite. Why each piece exists. [Read →](/arquitetura/)
+    Zig 0.16 + daemon + UNIX socket + SQLite WAL + zaudio. Single binary, two modes. [Read →](/arquitetura/)
   </Card>
   <Card title="TTS engine" icon="approve-check-circle">
-    `say` Premium Luciana wins. Piper/Kokoro/Coqui/ElevenLabs comparison. [Read →](/motor/)
+    Piper Faber by default for neural quality, macOS `say` as offline fallback. [Read →](/motor/)
   </Card>
   <Card title="Roadmap" icon="rocket">
-    v0.1 → v1.0 in ~6 weeks. Acceptance criteria per milestone. [Read →](/roadmap/)
+    v0.1 → v1.0 shipped in one day. v1.1+ adds multilingual + Linux. [Read →](/roadmap/)
   </Card>
 </CardGrid>
 
+## Designed for AI agents
+
+- **Stable line protocol** over UNIX socket — easy to wrap from any language
+- **Sub-millisecond round-trip ACK** — the agent moves on while the voice plays
+- **Crash-safe queue** in SQLite WAL — texts survive a daemon restart
+- **No paywall, no quota** — runs entirely on your Mac
+
 ## Locked constraints
 
-- **Platform**: Mac Air M4 only in v1.0 (Linux v1.1+)
-- **SSD**: binary < 2MB, no embedded model
+- **Platform**: Apple Silicon macOS in v1.0 (Linux v1.1+)
+- **Footprint**: single ~975 KB binary, no embedded voice model
 - **Single binary**: CLI and daemon share the executable
-- **Human Pt-BR**: natural voice, default cadence 180wpm, pauses driven by punctuation
+- **Pt-BR human cadence**: cardinals, abbreviations, and punctuation pauses preprocessed
 
-> Living document. Every decision is re-evaluated if measured TTFA drifts off target.
+> Living document. Every decision is re-evaluated if measured TTFA drifts off target. PRs welcome at [biliboss/agent-tts](https://github.com/biliboss/agent-tts).
