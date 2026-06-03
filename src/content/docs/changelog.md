@@ -9,6 +9,55 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.5 — MCP server · 2026-06-03
+
+**Shipped**:
+
+- `src/mcp.zig` — stdio JSON-RPC 2.0 server bundled in the same Zig binary. New subcommand `agent-tts mcp` opens a newline-delimited JSON loop on stdin/stdout. No new dependencies; uses `std.json` for parse and `std.json.Stringify.valueAlloc` for serialize
+- Three JSON-RPC methods implemented: `initialize` (returns `protocolVersion: 2024-11-05`, `capabilities.tools.listChanged=false`, `serverInfo`), `notifications/initialized` (acked, no response), `tools/list` (returns the 5 tools), `tools/call` (dispatches by name)
+- 5 tools exposed: `say(text, engine?, voice?, rate?)`, `queue()`, `skip(id?)`, `clear()`, `voices()`. Each is a thin shim over the existing UNIX socket protocol — no changes to `daemon.zig`, `ipc.zig`, `queue.zig`. `voices` enumerates hardcoded Luciana + Felipe and scans `~/.cache/agent-tts/voices/*.onnx` for piper voices
+- `src/client.zig` — extracted four pure helpers (`enqueueLine`, `queueLines`, `skipOp`, `clearOp`) plus a `QueueItem` struct. CLI surface unchanged; helpers are silent (no stdout, no process.exit) so the MCP server can compose them
+- `src/main.zig` — `VERSION = "1.5.0"`, HELP updated with `agent-tts mcp` line and a one-line Claude Code config snippet
+- `build.zig.zon` — `.version = "1.5.0"`
+- `scripts/install-mcp.sh` — idempotent installer that merges the `mcpServers."agent-tts"` block into `~/.claude.json` via `jq`. Backs up before writing, refuses to touch a non-object JSON, prints the snippet when jq is missing
+- New docs page `src/content/docs/mcp.md` (TL;DR + install + 5 tools + JSON-RPC samples + Claude Code walkthrough), added to the Starlight sidebar between "What's next" and "Changelog". `arquitetura.md` got an MCP subsection; `roadmap.md` got the v1.5 row; `whats-next.md` lost the v1.5 section
+
+**Measurements** (Mac Air M4, ReleaseFast, libpiper OFF):
+
+| Metric | Value | v1.5 target |
+|---|---|---|
+| Host arm64 binary size | 1 016 440 B (~993 KB) | < 1.1 MB ✅ |
+| Size delta vs v1.0 (916 KB) | +~115 KB | informational (mcp.zig + std.json) |
+| `tools/list` round-trip end-to-end (echo \| binary, no daemon) | sub-millisecond | qualitative ✅ |
+| `tools/call → voices` round-trip (echo \| binary) | sub-millisecond | qualitative ✅ |
+| `zig build test` | 27/27 + 6 new MCP tests | green ✅ |
+| Smoke test against real Claude Code | not measured | deferred |
+
+**Honest scope**:
+
+- **Tools only.** MCP also defines `prompts/*`, `resources/*`, `sampling/*`, `logging/*`, and server-initiated progress notifications. v1.5 ships none of those. A voice agent needs tools and only tools. The other primitives land when somebody asks
+- **End-to-end against a real Claude Code session not validated.** Smoke-tested via `echo '{...}\n' | agent-tts mcp` — initialize handshake correct, tools/list returns 5 entries, tools/call → voices returns the expected ONNX-scan output, tools/call → queue returns the right `isError: true` when no daemon is running
+- **`skip` ignores the `id` parameter** — the daemon's SKIP command always targets the currently playing item. The schema documents this. v1.6 will route by id when the queue knows how to interrupt non-head items
+- **`voices` enumerates `say` voices from a hardcoded list** (Luciana, Felipe). Querying `say -v ?` would spawn a process per call; defer to v1.6
+- Errors from `client.queueLines` / `enqueueLine` are wrapped into `isError: true` MCP responses with a `text` block explaining the failure ("daemon not running", "daemon error", "daemon unexpected response"). The MCP loop itself never crashes the process — parse errors become `-32700`, missing methods become `-32601`
+
+**Install snippet** (for `~/.claude.json` — or run `./scripts/install-mcp.sh`):
+
+```json
+{
+  "mcpServers": {
+    "agent-tts": {
+      "command": "/opt/homebrew/bin/agent-tts",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Why a single subcommand instead of a dedicated binary**: MCP clients spawn the server on demand and pipe stdio. Bundling the server in the same `agent-tts` binary means one install path, one version number, one set of tests.
+
+---
+
 ## v1.3 — Cross-platform · 2026-06-03
 
 **Shipped**:

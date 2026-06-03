@@ -1,48 +1,21 @@
 ---
 title: What's next
-description: Two next versions of agent-tts — voice cloning and native Claude Code voice via MCP.
+description: v1.1 → v1.5 all shipped 2026-06-03. Next milestones land here when planned.
 ---
 
 ## TL;DR
 
-v1.1 shipped multilingual code-switch (`MultiPiperEngine` + `--lang auto|pt|en` + En Amy voice routing). v1.2 added sentence-streaming so long inputs hit first-audio in ~50 ms instead of ~3 s. v1.3 shipped Linux espeak-ng + systemd + CI matrix. **What follows is about reach, not plumbing.** Two themes pulled out of the v1.1+v1.2+v1.3 backlog and pointed at the audiences that will care.
+The whole **v1.1 → v1.5** marketing slate shipped on **2026-06-03**:
+
+- **v1.1 Multilingual** — `MultiPiperEngine` + `--lang auto|pt|en` + En Amy voice routing
+- **v1.2 Streaming** — sentence-chunk pipeline; long-input first-audio fell from ~3 s to ~50 ms
+- **v1.3 Cross-platform** — Linux espeak-ng + systemd + CI matrix
+- **v1.4 Voice cloning** — `voice clone` subcommand + XTTS-v2 Python sidecar scaffold
+- **v1.5 MCP server** — stdio JSON-RPC bridge for Claude Code, Cursor, Cline; see [MCP server](/mcp/)
+
+See the [Changelog](/changelog/) for measurements + honest scope per version. The next slate (v1.6+) is unscheduled — open a roadmap issue if you want to push priority.
 
 Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/agent-tts).
-
----
-
-<!-- v1.1 multilingual shipped; v1.2 streaming shipped; v1.3 cross-platform shipped. See Changelog. -->
-
----
-
-## v1.5 — MCP server · *Native Claude Code voice*
-
-> Today, Claude Code shells out to `agent-tts` via Bash. That works, but it's not native. v1.5 makes the agent speak through the same protocol it reads.
-
-**The problem today.** Shelling out costs a tool call slot, a roundtrip, and a permission prompt. There is no streaming, no SKIP from the agent's side, no queue inspection without parsing stdout.
-
-**What ships.** An [MCP](https://modelcontextprotocol.io) server bundled in the same Zig binary. New subcommand:
-
-```bash
-agent-tts mcp                # speak over stdio MCP, no shell
-```
-
-Tools exposed:
-
-| Tool | What it does |
-|------|--------------|
-| `say(text, engine?, voice?, rate?)` | enqueue + return item id |
-| `queue()` | list current items |
-| `skip(id?)` | skip current or specific |
-| `clear()` | drop pending |
-| `voices()` | list installed voices |
-
-**Why now.** MCP is the protocol every agent runner is converging on (Claude Code, Cursor, Cline, Continue). agent-tts already has a stable line protocol — MCP is a thin shim over it.
-
-**Who cares.**
-- Every Claude Code user. (Native voice, no shell prompt.)
-- Cursor / Cline / Continue users — same MCP works everywhere.
-- Anyone building an agent platform that wants TTS without writing their own.
 
 ---
 

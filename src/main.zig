@@ -22,6 +22,10 @@
 // v0.7: zaudio streaming PCM + --engine routing. Piper resident in daemon.
 // v1.0: universal binary + brew tap + GitHub Pages docs.
 // v1.1: language detection + En Piper voice routing (code-switch Pt+En).
+// v1.2: sentence chunking + pipelined synth/audio (streaming long inputs).
+// v1.3: cross-platform — Linux espeak-ng + systemd, Windows best-effort.
+// v1.4: `voice clone` + `voice list` subcommands; XTTS-v2 Python sidecar.
+// v1.5: stdio JSON-RPC MCP server (`agent-tts mcp`) for Claude Code / Cursor / Cline.
 //
 // KPI = time-to-first-audio (TTFA).
 
@@ -35,9 +39,10 @@ const platform = @import("platform.zig");
 const ipc = @import("ipc.zig");
 const audio = @import("audio.zig");
 const voice = @import("voice.zig");
+const mcp = @import("mcp.zig");
 const build_options = @import("build_options");
 
-pub const VERSION = "1.3.0";
+pub const VERSION = "1.5.0";
 
 const HELP =
     \\agent-tts v{s} — multilingual TTS via system voice or libpiper
@@ -58,6 +63,7 @@ const HELP =
     \\  agent-tts voice clone            clone a voice from a 20-120s WAV (v1.4+)
     \\    --sample <wav> --name <slug>
     \\  agent-tts voice list             list installed voices (faber + cloned)
+    \\  agent-tts mcp                    speak over stdio MCP (Claude Code / Cursor / Cline) (v1.5+)
     \\  agent-tts --voice "Felipe" "texto"
     \\  agent-tts --voice gabriel "..."  use a cloned voice (v1.4+)
     \\  agent-tts --rate 220 "texto"
@@ -97,6 +103,10 @@ const HELP =
     \\  Linux    ~/.config/systemd/user/agent-tts.service
     \\           (override unit name via AGENT_TTS_SYSTEMD_UNIT)
     \\  Windows  not implemented — runs foreground only in v1.3
+    \\
+    \\Claude Code MCP wire-up (single line in ~/.claude.json):
+    \\  "mcpServers": {{ "agent-tts": {{ "command": "agent-tts", "args": ["mcp"] }} }}
+    \\See ./scripts/install-mcp.sh for an idempotent installer.
     \\
 ;
 
@@ -161,6 +171,9 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, cmd, "voice")) {
             return voice.run(arena, io, home, args);
+        }
+        if (std.mem.eql(u8, cmd, "mcp")) {
+            return mcp.run(arena, io, home);
         }
         if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
             std.debug.print(HELP, .{VERSION});

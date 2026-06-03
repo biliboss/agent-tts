@@ -1,15 +1,15 @@
 ---
 title: Roadmap
-description: v0.1 → v1.3 shipped 2026-06-03 in a single session. v1.4, v1.5 in What's next.
+description: v0.1 → v1.5 shipped 2026-06-03 in a single session. Roadmap complete.
 ---
 
 ## TL;DR
 
-v0.1 → v1.0 shipped on **2026-06-03**, in one session, behind one KPI. v1.1 (multilingual code-switch), v1.2 (sentence streaming), v1.3 (cross-platform) landed the same day. Eleven milestones, each with a published measurement.
+v0.1 → v1.5 shipped on **2026-06-03**, in one session, behind one KPI. Thirteen milestones, each with a published measurement. Universal binary, brew tap, launchd + systemd auto-start, multilingual code-switch, sentence streaming, Linux/Windows code paths, voice cloning scaffold, and stdio JSON-RPC MCP server — all landed the same day.
 
-v1.4, v1.5 are scoped for marketing and engineering value in [What's next](/whats-next/).
+The next slate (v1.6+) is unscheduled; see [What's next](/whats-next/).
 
-## v0.1 → v1.3 — Shipped
+## v0.1 → v1.5 — Shipped
 
 Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss/agent-tts/tree/main/_qa) and a section in the [Changelog](/changelog/).
 
@@ -27,6 +27,7 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v1.2** | Sentence chunking + pipelined synth/playback | long-input first-audio **41-52 ms** (down from ~3 s), gap median 0.02 ms | 2026-06-03 |
 | **v1.3** | Cross-platform — Linux espeak-ng + systemd + CI matrix | macOS green, Linux green on CI, Windows compile-only | 2026-06-03 |
 | **v1.4** | `voice clone` + `voice list` + XTTS-v2 Python sidecar | surface + dispatch + 40/40 tests; install/smoke deferred to v1.4.1 | 2026-06-03 |
+| **v1.5** | MCP server: stdio JSON-RPC, 5 tools, native Claude Code voice | binary 993 KB (+115 KB), tools-only scope | 2026-06-03 |
 
 ## KPI delivered
 
@@ -92,13 +93,9 @@ Auto-start unit paths:
 - macOS: `~/Library/LaunchAgents/io.github.biliboss.agent-tts.plist`
 - Linux: `~/.config/systemd/user/agent-tts.service`
 
-## What's next (v1.4, v1.5)
+## What's next
 
-See [What's next](/whats-next/) for the marketing roadmap. Short version:
-
-| | Theme | Headline |
-|---|---|---|
-| v1.5 | MCP server | Native Claude Code voice — drop the shell-out |
+The whole v1.1 → v1.5 marketing slate shipped 2026-06-03. The next slate is unscheduled — see [What's next](/whats-next/) for the policy and how to push priority.
 
 ## Locked nots
 

@@ -5,7 +5,7 @@ description: Single Zig binary, CLI + daemon over UNIX socket, SQLite WAL queue,
 
 ## TL;DR
 
-Single Zig 0.16 binary. Two modes share one executable: client (default) and daemon. The client sends a message over a UNIX socket. The daemon stores it in a SQLite WAL queue and drains serially. Each item is routed to one of two engines: **libpiper** (neural, default) or **macOS `say`** (fallback). Audio plays through **zaudio** (PCM streaming) for piper or directly through `say` for the system voice. Auto-start is handled by **launchd**.
+Single Zig 0.16 binary. Three modes share one executable: client (default), daemon, and MCP server. The client sends a message over a UNIX socket. The daemon stores it in a SQLite WAL queue and drains serially. Each item is routed to one of two engines: **libpiper** (neural, default) or **macOS `say`** (fallback). Audio plays through **zaudio** (PCM streaming) for piper or directly through `say` for the system voice. Auto-start is handled by **launchd**. The MCP mode (v1.5+) bridges stdio JSON-RPC to the same UNIX socket so agent runners like Claude Code, Cursor, and Cline call the daemon without a shell.
 
 Every component exists to cut **time-to-first-audio (TTFA)**.
 
@@ -59,9 +59,9 @@ Filesystem layout:
 
 Version pinned in `build.zig.zon` — Zig still breaks between minor releases.
 
-### CLI + daemon share the binary
+### CLI + daemon + MCP share the binary
 
-Cuts install surface. `agent-tts` without args = client. `agent-tts daemon` = server. Dispatch by `argv[1]`.
+Cuts install surface. `agent-tts` without args = client. `agent-tts daemon` = server. `agent-tts mcp` = stdio JSON-RPC bridge for MCP clients (v1.5+). Dispatch by `argv[1]`.
 
 The client does NOT fork the daemon. The daemon survives because of launchd (`agent-tts daemon install`), so the warm-path round-trip stays under a millisecond.
 
@@ -143,6 +143,42 @@ Vendored from [zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio). Linke
 
 `AudioPlayer.streamS16le(samples, 22050)` creates an `AudioBuffer` data source pinned to the source rate (22050 Hz for Faber). Without the explicit sample rate, miniaudio upsamples to the device rate (48000 Hz) and pitch shifts ~2.18× higher — a fix shipped in v1.0. `streamS16leAppend` is the v1.2 alias used by the streaming worker; today it shares `streamS16le`'s body because measured inter-chunk gaps stay below one device period.
 
+### MCP server (v1.5+)
+
+`src/mcp.zig` adds a third entry point: `agent-tts mcp` runs a stdio JSON-RPC 2.0 loop. Newline-delimited JSON (NOT LSP-style `Content-Length` framing — that is the MCP convention for stdio transport). Methods landed in v1.5:
+
+- `initialize` → returns `protocolVersion: 2024-11-05`, `capabilities.tools.listChanged=false`, `serverInfo`
+- `notifications/initialized` → acked, no response
+- `tools/list` → 5 tool descriptors
+- `tools/call` → dispatches by name; result is a `content: [{ type: "text", text: "..." }]` block + `isError: bool`
+
+The 5 tools shim the existing UNIX socket protocol via `client.zig` helpers — `enqueueLine`, `queueLines`, `skipOp`, `clearOp`:
+
+| Tool | Maps to | Returns |
+|------|---------|---------|
+| `say` | `ENQUEUE` | `{ id }` |
+| `queue` | `QUEUE` | `{ items: [...] }` |
+| `skip` | `SKIP` | `{ skipped_id }` |
+| `clear` | `CLEAR` | `{ cleared_count }` |
+| `voices` | local file scan | `{ voices: [...] }` (hardcoded `say` + `~/.cache/agent-tts/voices/*.onnx` for piper) |
+
+No new wire protocol, no daemon changes. The MCP server is a 500-line shim over the same socket the CLI uses. Errors from the daemon path become `isError: true` MCP responses with a human-readable `text` block; the JSON-RPC envelope itself only fails on parse errors (`-32700`) or unknown methods (`-32601`).
+
+Honest scope: `prompts/*`, `resources/*`, `sampling/*`, `logging/*`, and server-initiated progress notifications are not implemented. A voice agent needs tools and only tools — the other primitives land when somebody asks.
+
+Install snippet (also see `scripts/install-mcp.sh`):
+
+```json
+{
+  "mcpServers": {
+    "agent-tts": {
+      "command": "/opt/homebrew/bin/agent-tts",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
 ### Python sidecar (v1.4 — cloned engine only)
 
 `agent-tts voice clone --sample <wav> --name <slug>` spawns `scripts/voice_clone.py` via `std.process.Child` to extract the XTTS-v2 speaker conditioning latents from the reference WAV. Synthesis at request time spawns `scripts/voice_synth.py`, which reads text on stdin and writes raw s16le mono 22050Hz PCM to stdout. The daemon drains stdout into a buffer + feeds the same `AudioPlayer.streamS16le` path Faber uses.
@@ -217,24 +253,28 @@ Pre-warm (the empty `say` utterance that loads Luciana into the Neural Engine) b
 
 ```
 src/
-  main.zig         # entry, argv routing, ttfa-bench + piper-test subcommands
+  main.zig         # entry, argv routing, ttfa-bench + piper-test + voice + mcp subcommands
   platform.zig     # comptime OS dispatcher (macos / linux / windows)
-  client.zig       # enqueue, queue, skip, clear
+  client.zig       # enqueue, queue, skip, clear + pure helpers reused by mcp.zig
   daemon.zig       # accept loop, worker, engine routing
   queue.zig        # SQLite WAL wrapper, schema migration
-  ipc.zig          # line protocol, sanitize, Engine enum
+  ipc.zig          # line protocol, sanitize, Engine + Lang enums
   tts.zig          # spawn `say` (macOS) / `espeak-ng` (Linux) / powershell (Windows)
-  piper.zig        # libpiper FFI (GPL-3.0-or-later)
+  piper.zig        # libpiper FFI (GPL-3.0-or-later) + MultiPiperEngine (v1.1)
   audio.zig        # zaudio.Engine wrapper
-  preproc.zig      # Pt-BR cadence + abbreviations + cardinals
+  preproc.zig      # Pt-BR cadence + abbreviations + cardinals + chunkSentences (v1.2)
+  detect.zig       # v1.1 — Pt/En stopword-heuristic language detector
   launchd.zig      # LaunchAgent install / uninstall / status (macOS)
   systemd.zig      # systemd user unit install / uninstall / status (Linux)
   voice.zig        # v1.4 — `voice clone` / `voice list` subcommands
+  mcp.zig          # v1.5 — MCP server (stdio JSON-RPC 2.0)
 
 scripts/
   voice_clone.py        # v1.4 — XTTS-v2 speaker latent extraction
   voice_synth.py        # v1.4 — XTTS-v2 PCM synthesis to stdout
   setup-voice-clone.sh  # v1.4 — uv venv bootstrap
+  install-mcp.sh        # v1.5 — Claude Code MCP config installer
+  fetch-voice-en.sh     # v1.1 — Amy En voice
 ```
 
 Flat. No subdir until it hurts.
