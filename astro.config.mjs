@@ -34,6 +34,7 @@ export default defineConfig({
         { label: "What's next", link: '/whats-next/' },
         { label: 'MCP server', link: '/mcp/' },
         { label: 'Playground', link: '/playground/' },
+        { label: 'Menubar UI', link: '/menubar/' },
         { label: 'Changelog', link: '/changelog/' },
       ],
     }),

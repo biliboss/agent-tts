@@ -32,6 +32,7 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v1.7** | Streaming text input: `agent-tts stream` + `say_stream` MCP tool + incremental chunker | 166/166 tests, end-to-end CLI + MCP green, latency bench wired | 2026-06-03 |
 | **v1.8** | SSML 1.1 subset: `<emphasis>` / `<break>` / `<prosody>` / `<say-as>` for `say` + Piper | parse < 0.2 µs / 280 chars, +16 ssml tests + 5 ipc tests | 2026-06-03 |
 | **v1.9** | Web playground scaffold: Astro widget + voice picker + Speak button + 501 stub | scaffold only — WASM Piper synth deferred to v1.9.1 | 2026-06-03 |
+| **v1.10** | Menubar UI: SwiftUI status item + queue + Skip/Clear + voice picker | 911 Swift LOC, 321 KB .app binary; ducking + Linux GTK deferred to v1.10.1 | 2026-06-03 |
 
 ## KPI delivered
 

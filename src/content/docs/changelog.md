@@ -9,6 +9,43 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10 — Menubar UI · 2026-06-03
+
+**Shipped**:
+
+- `ui/menubar/` — Swift Package (Swift 5.9+, macOS 14+), 4 targets: `AgentTTSMenubarCore` (parser lib), `AgentTTSMenubar` (NSStatusItem + SwiftUI popover), `SocketProtocolCheck` (CLI smoke runner — XCTest is Xcode-only), `AgentTTSMenubarTests`. **911 Swift LOC across 7 files**
+- `SocketClient.swift` — POSIX UNIX-socket client. Implements ENQUEUE/QUEUE/SKIP/CLEAR against v1.1 6-field TSV. Permissive parser accepts v0.6 legacy ITEM layout. Raw `Darwin.socket` over `Network.framework` to keep warm-path latency near the 0.2-0.4 ms CLI floor
+- `AppDelegate.swift` — NSStatusItem with `speaker.wave.2` SF Symbol. Popover `.transient`. Polling on open / off on close. `LSUIElement` via setActivationPolicy + Info.plist (no dock icon)
+- `QueueView.swift` — SwiftUI list, 750 ms polling while popover open, click-to-skip on playing row, Skip + Clear footer, round-trip readout
+- `VoicePicker.swift` + `VoiceCatalog.swift` — Luciana/Felipe/Faber/Amy + cloned voices discovered under `~/.cache/agent-tts/voices/`. Selection persists to UserDefaults
+- `scripts/build-menubar.sh` — wraps `swift build -c release`, assembles `build/AgentTTSMenubar.app` (Info.plist LSUIElement=true, bundle id `io.github.biliboss.agent-tts.menubar`, version 1.10.0). Unsigned for v1.10
+- New docs page `src/content/docs/menubar.md` + sidebar entry in `astro.config.mjs`
+- `src/main.zig` + `build.zig.zon` → 1.10.0
+
+**Measurements** (Mac Air M4, Swift 6.3.2, ReleaseFast):
+
+| Metric | Value |
+|---|---|
+| Swift LOC | 911 |
+| `swift build -c release` cold | 32.3 s |
+| `swift build -c release` warm | 0.1 s |
+| `.app` release binary | 321 KB |
+| `SocketProtocolCheck` parser assertions | 13/13 pass |
+| `zig build` | green |
+| `zig build test` | green |
+
+**Honest scope**:
+- Volume ducking deferred to v1.10.1 (needs CoreAudio tap registration + entitlement + signed bundle)
+- Linux GTK4 deferred (separate runtime stack)
+- Per-id skip deferred (needs daemon `SKIP\t<id>\n` extension)
+- Drag-to-reorder deferred (needs daemon `MOVE` op)
+- `swift test` runs only under Xcode — bare CLI uses `SocketProtocolCheck` executable
+- No code signing / no notarization yet
+
+**Lead time**: see `_qa/v1.10-leadtime.md`. Elapsed **697 s (~11 min 37 s)** from dispatch.
+
+---
+
 ## v1.9 — Web playground · 2026-06-03
 
 **Scaffold only — WASM synth deferred to v1.9.1.** v1.9 ships the playground UI and the endpoint contract so the next version is a pure backend swap.
