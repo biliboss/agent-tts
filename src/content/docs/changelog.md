@@ -9,6 +9,52 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10 — Menubar UI · 2026-06-03
+
+**Shipped**:
+
+- `ui/menubar/` — Swift Package (Swift 5.9+, macOS 14+) with four targets: `AgentTTSMenubarCore` (pure parser library), `AgentTTSMenubar` (NSStatusItem + SwiftUI popover entry), `SocketProtocolCheck` (standalone smoke runner — exists because XCTest is Xcode-only on macOS Command Line Tools), and `AgentTTSMenubarTests` (XCTest, `canImport`-guarded). 911 Swift LOC across 7 files
+- `SocketClient.swift` — POSIX UNIX-socket client. Implements `ENQUEUE` / `QUEUE` / `SKIP` / `CLEAR` against the same v1.1 6-field TSV protocol the CLI uses (`src/ipc.zig`). Permissive parser accepts the v0.6 legacy `ITEM` layout (no engine field) so a stale daemon doesn't break the UI. Picked raw `Darwin.socket` over `Network.framework` because NWConnection's callback model adds latency on the warm path the CLI publishes as 0.2-0.4 ms
+- `AppDelegate.swift` — NSStatusItem with the `speaker.wave.2` SF Symbol. Popover behavior is `.transient`. Polling starts on open / stops on close to save IPC traffic. `LSUIElement` is set via `NSApp.setActivationPolicy(.accessory)` and in the bundle Info.plist so no dock icon shows up
+- `QueueView.swift` — SwiftUI list of pending + playing rows. Polls every 750 ms while the popover is open. Click-to-skip works on the playing row today; pending rows show the chrome (click target + state badge) so the v1.10.1 per-id skip plugs in without UI churn. Skip + Clear buttons in the footer; round-trip latency readout next to them
+- `VoicePicker.swift` + `VoiceCatalog.swift` — dropdown listing Luciana / Felipe / Faber / Amy plus any cloned voices discovered under `~/.cache/agent-tts/voices/<slug>/metadata.json`. Selection persists to UserDefaults under `AgentTTSMenubar.selectedVoiceId`
+- `scripts/build-menubar.sh` — wraps `swift build -c release` and assembles a `build/AgentTTSMenubar.app` bundle with a minimal Info.plist (`LSUIElement=true`, bundle id `io.github.biliboss.agent-tts.menubar`, version 1.10.0). Unsigned for v1.10 — Gatekeeper sees it as "from unidentified developer" until v1.10.1
+- `ui/menubar/README.md` — build + install instructions, protocol notes, honest-scope callout
+- New docs page `src/content/docs/menubar.md` linked from the Starlight sidebar between MCP and Changelog
+- `arquitetura.md` got a "Third client: SwiftUI menubar app" note next to the existing CLI + MCP description
+- `src/main.zig` `VERSION = "1.10.0"`, `build.zig.zon` `.version = "1.10.0"`
+
+**Measurements** (Mac Air M4, Swift 6.3.2 / swift-driver 1.148.6, ReleaseFast for the Zig binary, `swift build -c release` for the menubar):
+
+| Metric | Value |
+|---|---|
+| Swift LOC (Sources + Tests, ex-package manifest) | 911 |
+| `swift build -c release` cold | 32.3 s |
+| `swift build -c release` warm (no source change) | 0.1 s |
+| `AgentTTSMenubar` release binary size | 321 KB |
+| `SocketProtocolCheck` parser assertions | 13/13 pass |
+| `zig build` | green |
+| `zig build test` | green (existing 27 tests + ipc parser tests untouched) |
+| Live socket round-trip from the popover | not captured this session — needs a running daemon |
+
+**Honest scope**:
+
+- **Volume ducking deferred to v1.10.1.** The spec mentioned a "volume duck while speaking" toggle that drops other apps' output to 30% during agent speech via CoreAudio AVAudioSession. That needs `AudioObjectGetPropertyData` + tap registration + a `com.apple.security.device.audio-input`-adjacent entitlement, and signing the bundle so the entitlement actually takes effect. None of that is one-session work. The UI doesn't even show the toggle yet — adding a disabled toggle would advertise a feature we don't ship. v1.10.1
+- **Linux GTK4 deferred.** Spec called for a best-effort GTK4 status icon on Linux. Out of scope for one session and a separate language/runtime stack — `libadwaita` + GTK4 + Linux daemon validation would double the work. v1.10.1 or v1.11
+- **Per-id skip deferred.** Daemon's `SKIP\n` always targets the head of the queue (`src/daemon.zig`). UI rows are clickable for forward-compat, but only the playing row currently acts. Per-id skip needs a daemon-side `SKIP\t<id>\n` extension. v1.10.1
+- **Drag-to-reorder pending items deferred.** Same reason — needs a daemon-side `MOVE` op
+- **`swift test` runs only under Xcode.** XCTest is Xcode-only on macOS Command Line Tools, and Swift Testing's macro plugin (`TestingMacros`) is also Xcode-only. We compile the XCTest file with `#if canImport(XCTest)` so the package builds on bare CLI, and ship `SocketProtocolCheck` (a plain executable) as the CI-portable smoke runner. `swift run -c release SocketProtocolCheck` exits 0 and asserts 13 parser cases
+- **No code signing / no notarization.** The `.app` bundle is unsigned. Wrapping that into a brew cask + signing certificate lands with v1.10.1
+- **End-to-end smoke against a real running daemon not captured.** The build succeeded, parser tests pass, the daemon protocol is the same one the CLI exercises in the v1.0 → v1.5 sessions. A `_qa/v1.10-baseline.md` with screenshot + round-trip ms gets captured in v1.10.1
+
+**Lead-time**: see `_qa/v1.10-leadtime.md` (start + commit timestamps + delta).
+
+**Why a Swift Package and not an Xcode project**: Swift Package builds from the command line on any macOS with the Command Line Tools installed — no Xcode dependency for CI, no `.xcodeproj` to merge-conflict on. The trade-off is XCTest, which we route around with the SocketProtocolCheck executable.
+
+**Why a third client on the same socket and not a daemon API change**: the daemon is already-validated runtime code (v0.2-v1.5). A new client surface is additive — zero risk of breaking the CLI warm path. Same reason the MCP server (v1.5) is a stdio shim over the same socket: protocol stability is the cheap win.
+
+---
+
 ## v1.5 — MCP server · 2026-06-03
 
 **Shipped**:

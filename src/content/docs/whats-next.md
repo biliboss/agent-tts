@@ -1,11 +1,11 @@
 ---
 title: What's next
-description: Five next versions of agent-tts (v1.6 → v1.10) — voice cloning ship-it, streaming text input, SSML/prosody, web playground, and menubar UI.
+description: Four next versions of agent-tts (v1.6 → v1.9) — voice cloning ship-it, streaming text input, SSML/prosody, and web playground.
 ---
 
 ## TL;DR
 
-The whole **v1.1 → v1.5** marketing slate shipped on **2026-06-03**. The next slate (**v1.6 → v1.10**) takes the runtime and points it at five distinct audiences: people who want their cloned voice to actually work, people who want the agent to start speaking before it finishes thinking, people who want their agent to inflect, people who want to try every voice in a browser, and people who want a face on the daemon.
+The whole **v1.1 → v1.5** marketing slate shipped on **2026-06-03**, and **v1.10** (the menubar UI) jumped the queue and shipped the same day. The remaining slate (**v1.6 → v1.9**) takes the runtime and points it at four distinct audiences: people who want their cloned voice to actually work, people who want the agent to start speaking before it finishes thinking, people who want their agent to inflect, and people who want to try every voice in a browser.
 
 Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/agent-tts).
 
@@ -93,29 +93,6 @@ Vote, watch, or send a PR at [biliboss/agent-tts](https://github.com/biliboss/ag
 - First-time visitors who don't yet trust the install.
 - Tweet readers who land for one demo.
 - Podcasters / editors auditioning voices before they wire one into a workflow.
-
----
-
-## v1.10 — Menubar UI · *Voice agent gets a face*
-
-> The daemon runs invisible. Skip/clear/queue are CLI verbs. v1.10 ships a 200×400 menubar app showing the queue, the currently-playing item, and a one-click voice picker.
-
-**The problem today.** `agent-tts queue` is the only window into the daemon. There is no skip button, no volume slider, no visual cue that the agent just started speaking.
-
-**What ships.**
-- macOS menubar app (Swift, SwiftUI, ~1 MB binary) talking the same UNIX socket protocol as the CLI
-- Live queue with `pending` / `playing` highlight, click-to-skip, drag-to-reorder
-- Voice picker dropdown (Faber / Amy / Luciana / cloned) — switches the daemon's default mid-session
-- "Volume duck while speaking" toggle — drops other apps' output to 30% during agent speech via CoreAudio AVAudioSession ducking
-- Linux equivalent ships as a GTK4 status icon (best-effort, less polish)
-- The daemon stays unchanged — UI is a thin LiveView-style client, all state lives on the socket
-
-**Why now.** Once an agent speaks well, the next question is "how do I see what it's doing?" v1.10 makes the daemon legible. Also, "menubar app" is the proof-point that puts agent-tts on Product Hunt and into "AI tools for Mac" lists.
-
-**Who cares.**
-- Power users who like agent voice but want visible controls.
-- Mac users who expect every background daemon to have a menubar entry.
-- Onlookers — the menubar icon is the only ad agent-tts will ever buy.
 
 ---
 

@@ -33,6 +33,7 @@ export default defineConfig({
         { label: 'Roadmap', link: '/roadmap/' },
         { label: "What's next", link: '/whats-next/' },
         { label: 'MCP server', link: '/mcp/' },
+        { label: 'Menubar UI', link: '/menubar/' },
         { label: 'Changelog', link: '/changelog/' },
       ],
     }),

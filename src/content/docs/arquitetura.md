@@ -65,6 +65,10 @@ Cuts install surface. `agent-tts` without args = client. `agent-tts daemon` = se
 
 The client does NOT fork the daemon. The daemon survives because of launchd (`agent-tts daemon install`), so the warm-path round-trip stays under a millisecond.
 
+### Third client: SwiftUI menubar app (v1.10+)
+
+`ui/menubar/AgentTTSMenubar.app` is a Swift Package outside the Zig binary that talks the same UNIX-socket TSV protocol. NSStatusItem hosts a 320×420 SwiftUI popover with the live queue, Skip + Clear buttons, and a voice picker that discovers cloned voices under `~/.cache/agent-tts/voices/<slug>/metadata.json`. The daemon is unchanged — the menubar app is a third client on the wire, alongside the CLI and the MCP shim. See [Menubar UI](/menubar/).
+
 ### IPC: UNIX socket
 
 Path: `~/.cache/agent-tts/sock`. Faster than TCP loopback (no checksum, no TCP stack). Line-delimited TSV protocol:
