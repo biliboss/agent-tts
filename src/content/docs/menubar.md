@@ -36,12 +36,40 @@ Then drag it into `Login Items` (System Settings → General → Login Items) so
 
 - **Header** — title + refresh button (forces a queue re-poll).
 - **Voice picker** — Luciana / Felipe / Faber / Amy plus any cloned voices discovered under `~/.cache/agent-tts/voices/<slug>/metadata.json` (same probe path `agent-tts --voice <slug>` uses). Selection persists to UserDefaults under `AgentTTSMenubar.selectedVoiceId`.
+- **Floating-player toggle** (v1.10.2+) — "Show floating player while speaking" mirrors `AgentTTSMenubar.floatingPlayerEnabled` in UserDefaults. Default OFF on upgrade. When ON, the panel auto-shows during playback and auto-hides on idle (see below).
 - **Queue list** — one row per item with a state dot (green = playing, grey = pending), the text preview, the engine + voice + rate, and the daemon's `id`. Polls every 750 ms while the popover is open, 0 polls while it's closed.
 - **Footer** — Skip + Clear buttons (same semantics as `agent-tts skip` / `agent-tts clear`), last-poll round-trip readout in milliseconds, power button to quit.
 
+## Floating player (v1.10.2+)
+
+A compact 320×60 `NSPanel` that floats above other windows (`level = .floating`, `.canJoinAllSpaces`) and surfaces the currently playing item plus controls — so you can pause/resume/skip/replay without opening the popover. Lifecycle:
+
+1. AppDelegate polls `agent-tts queue` every 750 ms regardless of popover state.
+2. When a `state == "playing"` row appears AND the user toggled the widget on, the panel `orderFrontRegardless()`s.
+3. When the queue empties or the playing row clears, the panel `orderOut()`s.
+4. The panel persists its frame to `UserDefaults.AgentTTSMenubar.floatingFrame` (NSStringFromRect) so the user's preferred screen corner is sticky.
+
+Controls:
+
+- **Pause / Resume** (single button — SF Symbol switches `pause.fill` ↔ `play.fill`) → calls daemon `PAUSE` / `RESUME`. Disabled when no current item.
+- **Skip** → daemon `SKIP`.
+- **Replay** → daemon `REPLAY\t<currently-playing-id>` (re-enqueues the same utterance as a new pending row).
+
+Enable from the popover toggle, or via shell:
+
+```bash
+defaults write io.github.biliboss.agent-tts.menubar AgentTTSMenubar.floatingPlayerEnabled -bool true
+osascript -e 'tell application "AgentTTSMenubar" to quit'
+open /Applications/AgentTTSMenubar.app
+```
+
+![Floating player overlay — captured live from /Applications/AgentTTSMenubar.app on macOS 26.5](/agent-tts/screenshots/menubar-v1.10.1.png)
+
+> Screenshot above is the v1.10.1 baseline; the v1.10.2 floating-player render lives at `_qa/v1.10.2-floating-player-full.png` in the repo until the docs publish step grabs a clean crop.
+
 ## Protocol
 
-The Swift client implements the v1.1 6-field `ENQUEUE` form and the matching `QUEUE` / `SKIP` / `CLEAR` ops. Same wire as [`src/ipc.zig`](https://github.com/biliboss/agent-tts/blob/main/src/ipc.zig):
+The Swift client implements the v1.1 6-field `ENQUEUE` form and the matching `QUEUE` / `SKIP` / `CLEAR` ops, plus the v1.10.2 player ops `PAUSE` / `RESUME` / `REPLAY` / `HISTORY`. Same wire as [`src/ipc.zig`](https://github.com/biliboss/agent-tts/blob/main/src/ipc.zig):
 
 ```
 → ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<text>\n
@@ -57,6 +85,20 @@ The Swift client implements the v1.1 6-field `ENQUEUE` form and the matching `QU
 
 → CLEAR\n
 ← OK\t<count>\n     (count of dropped pending items)
+
+→ PAUSE\n           (v1.10.2)
+← OK\t<id>\n        | ERR\tnothing playing\n
+
+→ RESUME\n          (v1.10.2)
+← OK\t<id>\n        | ERR\tnot paused\n
+
+→ REPLAY\t<id>\n    (v1.10.2)
+← OK\t<new_id>\n    | ERR\titem not found\n
+
+→ HISTORY\t<limit>\n  (v1.10.2; limit clamped to 100, 0 = default 20)
+← ITEM\t<id>\t<state>\t<engine>\t<voice>\t<rate>\t<finished_at>\t<text>\n
+← ...
+← END\n
 ```
 
 The parser is permissive: it also accepts the v0.6 legacy `ITEM\t<id>\t<state>\t<voice>\t<rate>\t<text>` layout so a stale daemon doesn't break the UI.

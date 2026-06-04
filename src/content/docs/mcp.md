@@ -5,7 +5,7 @@ description: Native Claude Code / Cursor / Cline voice — agent-tts speaks via 
 
 ## TL;DR
 
-`agent-tts mcp` runs a stdio JSON-RPC 2.0 server that exposes the daemon to any [Model Context Protocol](https://modelcontextprotocol.io) client. Claude Code, Cursor, Cline, Continue — same wire, same 5 tools. No shell-out, no permission prompt per call, no stdout parsing.
+`agent-tts mcp` runs a stdio JSON-RPC 2.0 server that exposes the daemon to any [Model Context Protocol](https://modelcontextprotocol.io) client. Claude Code, Cursor, Cline, Continue — same wire, same **10 tools** (v1.10.2). No shell-out, no permission prompt per call, no stdout parsing.
 
 Bundled in the same Zig binary as the CLI and the daemon. `+115 KB` over v1.0. Tools only — `prompts/`, `resources/`, `sampling/` are deferred.
 
@@ -38,19 +38,24 @@ Then restart Claude Code (or your client) so it picks up the new server. Verify:
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | agent-tts mcp
 ```
 
-You should get back a single JSON line listing the 5 tools.
+You should get back a single JSON line listing the 10 tools.
 
-## The 5 tools
+## The 10 tools
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `say` | `{ text, engine?, voice?, rate? }` | `{ id }` |
+| `say` | `{ text, engine?, voice?, rate?, ssml? }` | `{ id }` |
 | `queue` | `{}` | `{ items: [...] }` |
 | `skip` | `{ id? }` (ignored in v1.5) | `{ skipped_id }` |
 | `clear` | `{}` | `{ cleared_count }` |
 | `voices` | `{}` | `{ voices: [...] }` |
+| `say_stream` (v1.7+) | `{ stream_id, chunk, final?, engine?, voice?, rate? }` | `{ enqueued_count, final }` |
+| `pause` (v1.10.2+) | `{}` | `{ paused_id }` (0 = nothing playing) |
+| `resume` (v1.10.2+) | `{}` | `{ resumed_id }` (0 = not paused) |
+| `replay` (v1.10.2+) | `{ id }` | `{ new_id }` (0 = item not found) |
+| `history` (v1.10.2+) | `{ limit? }` (1..100, default 20) | `{ items: [{id,state,engine,voice,rate,finished_at,text}, ...] }` |
 
-Each tool is a thin shim over the same UNIX socket the CLI uses. No new daemon code. Tool errors (daemon down, malformed args) come back as `isError: true` MCP responses with a human-readable text block — the JSON-RPC envelope only errors on parse failures (`-32700`) or unknown methods (`-32601`).
+Each tool is a thin shim over the same UNIX socket the CLI uses. No new daemon code beyond the v1.10.2 ops the four new tools wrap. Tool errors (daemon down, malformed args) come back as `isError: true` MCP responses with a human-readable text block — the JSON-RPC envelope only errors on parse failures (`-32700`) or unknown methods (`-32601`).
 
 ## JSON-RPC samples
 

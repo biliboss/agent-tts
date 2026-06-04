@@ -23,6 +23,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var popover: NSPopover!
     private let queueModel = QueueModel()
     private let voiceModel = VoicePickerModel()
+    // v1.10.2 — floating player overlay (always-on-top NSPanel).
+    private let floatingPlayer = FloatingPlayerController()
+    // Lightweight client for the polling timer so we don't reach into the
+    // QueueModel (which polls only while the popover is open).
+    private let floatingClient = SocketClient()
+    private var floatingTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hide the dock icon / app menu. We're menubar-only.
@@ -50,6 +56,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: 320, height: 420)
         let content = QueueView(model: queueModel, voiceModel: voiceModel)
         popover.contentViewController = NSHostingController(rootView: content)
+
+        // v1.10.2 — start the floating-player polling loop regardless of
+        // popover state. It only spawns IPC calls (no UI) until a playing
+        // item appears AND the user has enabled the widget. 750 ms keeps
+        // the daemon load similar to the popover's polling cadence.
+        startFloatingPolling()
     }
 
     @objc private func togglePopover(_ sender: Any?) {
@@ -63,6 +75,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             queueModel.startPolling()
             // Bring focus so keyboard works inside the popover.
             NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    // v1.10.2 — floating widget polling. Tick every 750 ms, look for the
+    // first "playing" row in the daemon's queue, update the floating
+    // model, and show/hide the panel based on item presence × user toggle.
+    private func startFloatingPolling() {
+        floatingTimer?.invalidate()
+        floatingTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tickFloating() }
+        }
+    }
+
+    private func tickFloating() {
+        let playing: QueueItem?
+        do {
+            let items = try floatingClient.queue()
+            playing = items.first(where: { $0.state == "playing" })
+        } catch {
+            // Daemon not running — clear UI and short-circuit.
+            playing = nil
+        }
+        floatingPlayer.model.update(playing: playing)
+
+        let userEnabled = FloatingPlayerController.enabled
+        if let _ = playing, userEnabled {
+            floatingPlayer.show()
+        } else {
+            floatingPlayer.hide()
         }
     }
 }

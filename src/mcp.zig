@@ -34,7 +34,7 @@ const ipc = @import("ipc.zig");
 const client = @import("client.zig");
 const preproc = @import("preproc.zig");
 
-pub const VERSION = "1.8.0";
+pub const VERSION = "1.10.2";
 pub const PROTOCOL_VERSION = "2024-11-05";
 
 const READ_BUF = 256 * 1024; // long agent monologues hit ~8 KB after escaping
@@ -214,6 +214,11 @@ fn buildToolsListResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
         try toolDescriptor(a, "clear", "Drop all pending TTS items. Returns the number dropped.", try emptySchema(a)),
         try toolDescriptor(a, "voices", "List installed voices for `say` and any piper ONNX models in ~/.cache/agent-tts/voices/.", try emptySchema(a)),
         try toolDescriptor(a, "say_stream", "Stream-feed Pt-BR TTS chunk-by-chunk. The server buffers bytes per stream_id, emits sentences to the daemon as terminators arrive, and flushes any remainder when final=true. Returns the count of sentences enqueued by this call.", try sayStreamSchema(a)),
+        // v1.10.2 — player ops.
+        try toolDescriptor(a, "pause", "Pause the active piper/cloned playback. Returns the paused item id (0 = nothing playing).", try emptySchema(a)),
+        try toolDescriptor(a, "resume", "Resume a paused item. Returns the resumed item id (0 = not paused).", try emptySchema(a)),
+        try toolDescriptor(a, "replay", "Re-enqueue a past item by id (any state). Returns the new pending id (0 = item not found).", try replaySchema(a)),
+        try toolDescriptor(a, "history", "List the last N items, including done/skipped. Default limit 20, max 100.", try historySchema(a)),
     });
     const result = try obj(a, &.{
         .{ "tools", tools },
@@ -324,6 +329,36 @@ fn sayStreamSchema(a: std.mem.Allocator) !json.Value {
     });
 }
 
+fn replaySchema(a: std.mem.Allocator) !json.Value {
+    const id_prop = try obj(a, &.{
+        .{ "type", str("integer") },
+        .{ "description", str("Id of the past item to replay. Look it up via the `history` tool or `agent-tts queue`/`history`.") },
+    });
+    const props = try obj(a, &.{
+        .{ "id", id_prop },
+    });
+    const required = try arr(a, &.{str("id")});
+    return try obj(a, &.{
+        .{ "type", str("object") },
+        .{ "properties", props },
+        .{ "required", required },
+    });
+}
+
+fn historySchema(a: std.mem.Allocator) !json.Value {
+    const limit_prop = try obj(a, &.{
+        .{ "type", str("integer") },
+        .{ "description", str("Number of rows to return (most recent first). Default 20, max 100. 0 → default.") },
+    });
+    const props = try obj(a, &.{
+        .{ "limit", limit_prop },
+    });
+    return try obj(a, &.{
+        .{ "type", str("object") },
+        .{ "properties", props },
+    });
+}
+
 fn skipSchema(a: std.mem.Allocator) !json.Value {
     const id_prop = try obj(a, &.{
         .{ "type", str("integer") },
@@ -369,8 +404,96 @@ fn buildToolsCallResponse(
     if (std.mem.eql(u8, tool, "clear")) return callClear(a, io, home, id);
     if (std.mem.eql(u8, tool, "voices")) return callVoices(a, io, home, id);
     if (std.mem.eql(u8, tool, "say_stream")) return callSayStream(a, io, home, id, args_val);
+    // v1.10.2 — player ops.
+    if (std.mem.eql(u8, tool, "pause")) return callPause(a, io, home, id);
+    if (std.mem.eql(u8, tool, "resume")) return callResume(a, io, home, id);
+    if (std.mem.eql(u8, tool, "replay")) return callReplay(a, io, home, id, args_val);
+    if (std.mem.eql(u8, tool, "history")) return callHistory(a, io, home, id, args_val);
 
     return try toolErrorResponse(a, id, "unknown tool");
+}
+
+fn callPause(a: std.mem.Allocator, io: std.Io, home: []const u8, id: json.Value) ![]const u8 {
+    const paused = client.pauseOp(a, io, home) catch |e| switch (e) {
+        error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
+        error.DaemonError => return try toolErrorResponse(a, id, "daemon error"),
+        error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon unexpected response"),
+        else => return e,
+    };
+    const payload = try obj(a, &.{
+        .{ "paused_id", int(@intCast(paused)) },
+    });
+    const text_block = try formatJsonAsText(a, payload);
+    return try toolTextResponse(a, id, text_block);
+}
+
+fn callResume(a: std.mem.Allocator, io: std.Io, home: []const u8, id: json.Value) ![]const u8 {
+    const resumed = client.resumeOp(a, io, home) catch |e| switch (e) {
+        error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
+        error.DaemonError => return try toolErrorResponse(a, id, "daemon error"),
+        error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon unexpected response"),
+        else => return e,
+    };
+    const payload = try obj(a, &.{
+        .{ "resumed_id", int(@intCast(resumed)) },
+    });
+    const text_block = try formatJsonAsText(a, payload);
+    return try toolTextResponse(a, id, text_block);
+}
+
+fn callReplay(a: std.mem.Allocator, io: std.Io, home: []const u8, id: json.Value, args: json.Value) ![]const u8 {
+    if (args != .object) return try toolErrorResponse(a, id, "arguments must be an object");
+    const ao = args.object;
+    const id_val = ao.get("id") orelse return try toolErrorResponse(a, id, "id is required");
+    if (id_val != .integer) return try toolErrorResponse(a, id, "id must be an integer");
+    if (id_val.integer <= 0) return try toolErrorResponse(a, id, "id must be > 0");
+    const src_id: u64 = @intCast(id_val.integer);
+
+    const new_id = client.replayOp(a, io, home, src_id) catch |e| switch (e) {
+        error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
+        error.DaemonError => return try toolErrorResponse(a, id, "daemon error"),
+        error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon unexpected response"),
+        else => return e,
+    };
+    const payload = try obj(a, &.{
+        .{ "new_id", int(@intCast(new_id)) },
+    });
+    const text_block = try formatJsonAsText(a, payload);
+    return try toolTextResponse(a, id, text_block);
+}
+
+fn callHistory(a: std.mem.Allocator, io: std.Io, home: []const u8, id: json.Value, args: json.Value) ![]const u8 {
+    var limit: u32 = 20;
+    if (args == .object) {
+        if (args.object.get("limit")) |l| {
+            if (l != .integer) return try toolErrorResponse(a, id, "limit must be an integer");
+            if (l.integer < 0 or l.integer > 100) return try toolErrorResponse(a, id, "limit out of range (0..100)");
+            limit = @intCast(l.integer);
+        }
+    }
+    const items = client.historyLines(a, io, home, limit) catch |e| switch (e) {
+        error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
+        error.DaemonError => return try toolErrorResponse(a, id, "daemon error"),
+        else => return e,
+    };
+    var list: json.Array = .init(a);
+    for (items) |it| {
+        const item_obj = try obj(a, &.{
+            .{ "id", str(it.id) },
+            .{ "state", str(it.state) },
+            .{ "engine", str(it.engine) },
+            .{ "voice", str(it.voice) },
+            .{ "rate", str(it.rate) },
+            .{ "finished_at", str(it.finished_at) },
+            .{ "text", str(it.text) },
+        });
+        try list.append(item_obj);
+    }
+    const payload = try obj(a, &.{
+        .{ "items", json.Value{ .array = list } },
+    });
+    const text_block = try formatJsonAsText(a, payload);
+    return try toolTextResponse(a, id, text_block);
 }
 
 fn callSay(
@@ -743,7 +866,7 @@ test "build initialize response shape" {
     try std.testing.expectEqual(false, tools.get("listChanged").?.bool);
 }
 
-test "build tools/list returns 5 tools" {
+test "build tools/list returns 10 tools (v1.10.2 + history/pause/resume/replay)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -751,14 +874,20 @@ test "build tools/list returns 5 tools" {
     const resp = try buildToolsListResponse(a, .{ .integer = 2 });
     const parsed = try json.parseFromSliceLeaky(json.Value, a, resp, .{});
     const tools = parsed.object.get("result").?.object.get("tools").?.array;
-    try std.testing.expectEqual(@as(usize, 5), tools.items.len);
+    try std.testing.expectEqual(@as(usize, 10), tools.items.len);
 
-    // Spot-check names. Order is fixed (say/queue/skip/clear/voices).
+    // Spot-check names. Order is fixed:
+    //   say/queue/skip/clear/voices/say_stream/pause/resume/replay/history.
     try std.testing.expectEqualStrings("say", tools.items[0].object.get("name").?.string);
     try std.testing.expectEqualStrings("queue", tools.items[1].object.get("name").?.string);
     try std.testing.expectEqualStrings("skip", tools.items[2].object.get("name").?.string);
     try std.testing.expectEqualStrings("clear", tools.items[3].object.get("name").?.string);
     try std.testing.expectEqualStrings("voices", tools.items[4].object.get("name").?.string);
+    try std.testing.expectEqualStrings("say_stream", tools.items[5].object.get("name").?.string);
+    try std.testing.expectEqualStrings("pause", tools.items[6].object.get("name").?.string);
+    try std.testing.expectEqualStrings("resume", tools.items[7].object.get("name").?.string);
+    try std.testing.expectEqualStrings("replay", tools.items[8].object.get("name").?.string);
+    try std.testing.expectEqualStrings("history", tools.items[9].object.get("name").?.string);
 
     // Every tool has an inputSchema with type=object.
     for (tools.items) |t| {

@@ -46,7 +46,7 @@ const mcp = @import("mcp.zig");
 const stream_mod = @import("stream.zig");
 const build_options = @import("build_options");
 
-pub const VERSION = "1.10.1";
+pub const VERSION = "1.10.2";
 
 const HELP =
     \\agent-tts v{s} — multilingual TTS via system voice or libpiper
@@ -59,6 +59,10 @@ const HELP =
     \\  agent-tts queue                  list pending + playing items
     \\  agent-tts skip                   skip current playing item
     \\  agent-tts clear                  drop all pending items
+    \\  agent-tts pause                  pause active playback (v1.10.2)
+    \\  agent-tts resume                 resume paused playback (v1.10.2)
+    \\  agent-tts replay <id>            re-enqueue a past item (v1.10.2)
+    \\  agent-tts history [--limit N]    list last N items, any state (v1.10.2)
     \\  agent-tts daemon                 run daemon (foreground)
     \\  agent-tts daemon install         install auto-start unit
     \\                                   (launchd on macOS, systemd on Linux)

@@ -36,7 +36,7 @@
 
 const std = @import("std");
 
-pub const Op = enum { enqueue, queue, skip, clear };
+pub const Op = enum { enqueue, queue, skip, clear, pause, resume_play, replay, history };
 
 pub const Engine = enum {
     say,
@@ -95,6 +95,20 @@ pub const Request = union(Op) {
     queue: void,
     skip: void,
     clear: void,
+    /// v1.10.2 — pause/resume the actively playing item. Both return
+    /// `OK\t<id>` on success or `ERR\t<reason>` when there's nothing to act
+    /// on. No payload on the wire — the daemon reads `current_playing_id`.
+    pause: void,
+    resume_play: void,
+    /// v1.10.2 — replay a prior item by id. Wire shape: `REPLAY\t<id>\n`.
+    /// Daemon copies the source row's engine/voice/rate/ssml/text into a
+    /// new pending row and acks `OK\t<new_id>`.
+    replay: u64,
+    /// v1.10.2 — list the last N items (any state). Wire shape:
+    /// `HISTORY\t<limit>\n`. Daemon emits `ITEM\t…` lines (same shape as
+    /// QUEUE but with extra finished_at field) followed by `END`. Limit is
+    /// clamped to 100 in the daemon for buffer hygiene.
+    history: u32,
 };
 
 pub fn socketPath(arena: std.mem.Allocator, io: std.Io, home: []const u8) ![]u8 {
@@ -231,6 +245,22 @@ pub fn parseRequest(arena: std.mem.Allocator, line: []const u8) ParseError!Reque
     if (std.mem.eql(u8, op, "QUEUE")) return .queue;
     if (std.mem.eql(u8, op, "SKIP")) return .skip;
     if (std.mem.eql(u8, op, "CLEAR")) return .clear;
+    // v1.10.2 — pause / resume / replay / history. PAUSE and RESUME take
+    // no payload. REPLAY takes a single u64 id. HISTORY takes a single
+    // u32 limit (clamped to 100 here).
+    if (std.mem.eql(u8, op, "PAUSE")) return .pause;
+    if (std.mem.eql(u8, op, "RESUME")) return .resume_play;
+    if (std.mem.eql(u8, op, "REPLAY")) {
+        const id_str = it.next() orelse return error.Malformed;
+        const id = std.fmt.parseInt(u64, id_str, 10) catch return error.Malformed;
+        return .{ .replay = id };
+    }
+    if (std.mem.eql(u8, op, "HISTORY")) {
+        const limit_str = it.next() orelse return error.Malformed;
+        const raw = std.fmt.parseInt(u32, limit_str, 10) catch return error.Malformed;
+        const limit: u32 = if (raw == 0) 20 else @min(raw, 100);
+        return .{ .history = limit };
+    }
     return error.UnknownOp;
 }
 
@@ -405,4 +435,76 @@ test "parseRequest legacy 5-field ENQUEUE with cloned engine (no lang)" {
     const req = try parseRequest(arena.allocator(), "ENQUEUE\tcloned\tgabriel\t330\tOlá");
     try std.testing.expectEqual(Engine.cloned, req.enqueue.engine);
     try std.testing.expectEqualStrings("gabriel", req.enqueue.voice);
+}
+
+// v1.10.2 — pause / resume / replay / history parser tests.
+
+test "parseRequest PAUSE has no payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(arena.allocator(), "PAUSE");
+    try std.testing.expect(req == .pause);
+}
+
+test "parseRequest RESUME has no payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(arena.allocator(), "RESUME");
+    try std.testing.expect(req == .resume_play);
+}
+
+test "parseRequest REPLAY parses u64 id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(arena.allocator(), "REPLAY\t42");
+    try std.testing.expect(req == .replay);
+    try std.testing.expectEqual(@as(u64, 42), req.replay);
+}
+
+test "parseRequest REPLAY without id is malformed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.Malformed, parseRequest(arena.allocator(), "REPLAY"));
+}
+
+test "parseRequest REPLAY with non-numeric id is malformed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.Malformed, parseRequest(arena.allocator(), "REPLAY\tabc"));
+}
+
+test "parseRequest HISTORY parses u32 limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(arena.allocator(), "HISTORY\t10");
+    try std.testing.expect(req == .history);
+    try std.testing.expectEqual(@as(u32, 10), req.history);
+}
+
+test "parseRequest HISTORY clamps limit to 100" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(arena.allocator(), "HISTORY\t999");
+    try std.testing.expectEqual(@as(u32, 100), req.history);
+}
+
+test "parseRequest HISTORY with 0 defaults to 20" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(arena.allocator(), "HISTORY\t0");
+    try std.testing.expectEqual(@as(u32, 20), req.history);
+}
+
+test "parseRequest unknown op still errors (no false positive on PAUSE prefix)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.UnknownOp, parseRequest(arena.allocator(), "PAUSED"));
+}
+
+test "v1.10.2 backward-compat: old QUEUE/SKIP/CLEAR still parse" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expect((try parseRequest(arena.allocator(), "QUEUE")) == .queue);
+    try std.testing.expect((try parseRequest(arena.allocator(), "SKIP")) == .skip);
+    try std.testing.expect((try parseRequest(arena.allocator(), "CLEAR")) == .clear);
 }

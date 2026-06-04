@@ -85,6 +85,11 @@ const Resources = struct {
     // isn't on disk — synth falls back to Pt and the warning logs once.
     piper: ?*piper_mod.MultiPiperEngine,
     io: std.Io,
+    /// v1.10.2 — id of the row the worker is currently playing. Set when
+    /// runOne begins, cleared on completion. IPC PAUSE/RESUME read this to
+    /// ack the affected id. 0 means "nothing playing right now". Atomic so
+    /// the accept thread can read without taking q.mu.
+    current_playing_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
@@ -171,7 +176,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
             std.debug.print("[daemon] accept failed: {s}\n", .{@errorName(e)});
             continue;
         };
-        handleClient(arena, io, &stream, &queue, &audio_player) catch |e| {
+        handleClient(arena, io, &stream, &resources) catch |e| {
             std.debug.print("[daemon] handle failed: {s}\n", .{@errorName(e)});
         };
         stream.close(io);
@@ -190,6 +195,11 @@ fn workerLoop(res: *Resources) void {
     while (res.queue.pop(io, gpa)) |item| {
         defer gpa.free(item.voice);
         defer gpa.free(item.text);
+        // v1.10.2 — publish the active id for PAUSE/RESUME ack. Cleared
+        // unconditionally on exit so a worker error doesn't leave a stale
+        // id visible to the next IPC client.
+        res.current_playing_id.store(item.id, .release);
+        defer res.current_playing_id.store(0, .release);
         runOne(res, io, gpa, item) catch |e| {
             std.debug.print("[worker] play id={d} engine={s} failed: {s}\n", .{
                 item.id, item.engine.str(), @errorName(e),
@@ -845,14 +855,16 @@ fn handleClient(
     arena: std.mem.Allocator,
     io: std.Io,
     stream: *std.Io.net.Stream,
-    queue: *Queue,
-    audio_player: *audio.AudioPlayer,
+    res: *Resources,
 ) !void {
     var read_buf: [READ_BUF]u8 = undefined;
     var write_buf: [WRITE_BUF]u8 = undefined;
 
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);
+
+    const queue = res.queue;
+    const audio_player = res.audio_player;
 
     const line = sr.interface.takeDelimiterExclusive('\n') catch |e| {
         try writeErr(&sw.interface, @errorName(e));
@@ -897,6 +909,65 @@ fn handleClient(
         .clear => {
             const n = queue.clearPending(io);
             try sw.interface.print("OK\t{d}\n", .{n});
+            try sw.interface.flush();
+        },
+        // v1.10.2 — pause the active piper/cloned playback. Returns the
+        // current_playing_id on success, ERR when nothing is playing or
+        // when the active path is `say` (separate process — pause would
+        // require SIGSTOP and bring SIGCONT complexity for v1.10.3+).
+        .pause => {
+            const id = res.current_playing_id.load(.acquire);
+            if (id == 0) {
+                try writeErr(&sw.interface, "nothing playing");
+                return;
+            }
+            if (!audio_player.pause()) {
+                try writeErr(&sw.interface, "nothing playing");
+                return;
+            }
+            try sw.interface.print("OK\t{d}\n", .{id});
+            try sw.interface.flush();
+        },
+        .resume_play => {
+            const id = res.current_playing_id.load(.acquire);
+            if (id == 0) {
+                try writeErr(&sw.interface, "not paused");
+                return;
+            }
+            if (!audio_player.resume_play()) {
+                try writeErr(&sw.interface, "not paused");
+                return;
+            }
+            try sw.interface.print("OK\t{d}\n", .{id});
+            try sw.interface.flush();
+        },
+        .replay => |src_id| {
+            const gpa = std.heap.smp_allocator;
+            const new_id_opt = queue.replay(io, gpa, src_id) catch |e| {
+                try writeErr(&sw.interface, @errorName(e));
+                return;
+            };
+            const new_id = new_id_opt orelse {
+                try writeErr(&sw.interface, "item not found");
+                return;
+            };
+            try sw.interface.print("OK\t{d}\n", .{new_id});
+            try sw.interface.flush();
+        },
+        .history => |limit| {
+            const items = queue.history(io, arena, limit) catch |e| {
+                try writeErr(&sw.interface, @errorName(e));
+                return;
+            };
+            // History ITEM wire shape extends QUEUE's by appending the
+            // `finished_at` field BEFORE the text. New consumers parse
+            // the extra column; old consumers won't be calling HISTORY.
+            for (items) |it| {
+                try sw.interface.print("ITEM\t{d}\t{s}\t{s}\t{s}\t{d}\t{d}\t{s}\n", .{
+                    it.id, it.state.str(), it.engine.str(), it.voice, it.rate, it.finished_at, it.text,
+                });
+            }
+            try sw.interface.writeAll("END\n");
             try sw.interface.flush();
         },
     }

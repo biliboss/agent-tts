@@ -37,6 +37,28 @@ public struct QueueItem: Identifiable, Hashable, Sendable {
     }
 }
 
+/// v1.10.2 — one row returned by `history()`. Same shape as QueueItem
+/// plus the `finishedAt` epoch seconds (0 when not yet finished).
+public struct HistoryItem: Identifiable, Hashable, Sendable {
+    public let id: String
+    public let state: String
+    public let engine: String
+    public let voice: String
+    public let rate: String
+    public let finishedAt: String
+    public let text: String
+
+    public init(id: String, state: String, engine: String, voice: String, rate: String, finishedAt: String, text: String) {
+        self.id = id
+        self.state = state
+        self.engine = engine
+        self.voice = voice
+        self.rate = rate
+        self.finishedAt = finishedAt
+        self.text = text
+    }
+}
+
 public enum SocketError: Error, LocalizedError {
     case daemonUnreachable(String)
     case daemonError(String)
@@ -105,6 +127,95 @@ public struct SocketClient {
         let reply = try roundTrip("CLEAR\n")
         let idStr = try Self.parseOk(reply)
         return UInt64(idStr) ?? 0
+    }
+
+    // MARK: - v1.10.2 player ops
+
+    /// Pause the active piper/cloned playback. Returns the paused item id,
+    /// or 0 when the daemon reports "nothing playing" (NOT an error path —
+    /// matches the FloatingPlayer's empty-state UX).
+    @discardableResult
+    public func pause() throws -> UInt64 {
+        let reply = try roundTrip("PAUSE\n")
+        if reply.hasPrefix("OK\t") {
+            return UInt64(reply.dropFirst(3)) ?? 0
+        }
+        if reply.hasPrefix("ERR\t") {
+            let msg = String(reply.dropFirst(4))
+            if msg.contains("nothing playing") { return 0 }
+            throw SocketError.daemonError(msg)
+        }
+        throw SocketError.unexpected(reply)
+    }
+
+    /// Resume a paused item. Returns the resumed id, or 0 when nothing is
+    /// paused. Counterpart to `pause()`.
+    @discardableResult
+    public func resumePlayback() throws -> UInt64 {
+        let reply = try roundTrip("RESUME\n")
+        if reply.hasPrefix("OK\t") {
+            return UInt64(reply.dropFirst(3)) ?? 0
+        }
+        if reply.hasPrefix("ERR\t") {
+            let msg = String(reply.dropFirst(4))
+            if msg.contains("not paused") { return 0 }
+            throw SocketError.daemonError(msg)
+        }
+        throw SocketError.unexpected(reply)
+    }
+
+    /// Re-enqueue a past item by id. Returns the new pending id, or 0
+    /// when the daemon reports "item not found".
+    @discardableResult
+    public func replay(id: UInt64) throws -> UInt64 {
+        let reply = try roundTrip("REPLAY\t\(id)\n")
+        if reply.hasPrefix("OK\t") {
+            return UInt64(reply.dropFirst(3)) ?? 0
+        }
+        if reply.hasPrefix("ERR\t") {
+            let msg = String(reply.dropFirst(4))
+            if msg.contains("item not found") { return 0 }
+            throw SocketError.daemonError(msg)
+        }
+        throw SocketError.unexpected(reply)
+    }
+
+    /// Fetch the last `limit` rows (any state) from the daemon. Limit is
+    /// clamped to 100 daemon-side; default 20.
+    public func history(limit: UInt32 = 20) throws -> [HistoryItem] {
+        let lines = try roundTripMulti("HISTORY\t\(limit)\n")
+        var out: [HistoryItem] = []
+        for line in lines {
+            if line == "END" { break }
+            if line.hasPrefix("ERR\t") {
+                throw SocketError.daemonError(String(line.dropFirst(4)))
+            }
+            if let item = Self.parseHistoryItem(line) {
+                out.append(item)
+            }
+        }
+        return out
+    }
+
+    /// Parse one HISTORY `ITEM` line. Wire shape is the QUEUE shape with
+    /// an extra `finished_at` column between `rate` and `text`:
+    ///   ITEM\t<id>\t<state>\t<engine>\t<voice>\t<rate>\t<finished>\t<text>
+    public static func parseHistoryItem(_ line: String) -> HistoryItem? {
+        guard line.hasPrefix("ITEM\t") else { return nil }
+        let rest = String(line.dropFirst(5))
+        let parts = rest.split(separator: "\t", omittingEmptySubsequences: false)
+        guard parts.count >= 7 else { return nil }
+        let id = String(parts[0])
+        let state = String(parts[1])
+        let engine = String(parts[2])
+        let voice = String(parts[3])
+        let rate = String(parts[4])
+        let finished = String(parts[5])
+        let text = parts[6...].joined(separator: "\t")
+        return HistoryItem(
+            id: id, state: state, engine: engine, voice: voice,
+            rate: rate, finishedAt: finished, text: text
+        )
     }
 
     // MARK: - Parsing (visible for tests)

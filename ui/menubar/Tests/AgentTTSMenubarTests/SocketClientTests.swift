@@ -93,5 +93,35 @@ final class SocketClientTests: XCTestCase {
         let result = VoiceCatalog.clonedVoices(home: "/tmp/agent-tts-test-nonexistent-\(UUID().uuidString)")
         XCTAssertTrue(result.isEmpty)
     }
+
+    // v1.10.2 — history ITEM row parser. Mirrors the daemon's 7-column
+    // wire shape: id, state, engine, voice, rate, finished_at, text.
+    func testParseHistoryItemHappyPath() {
+        let line = "ITEM\t5\tdone\tpiper\tfaber\t330\t1780000000\tOlá mundo"
+        let item = SocketClient.parseHistoryItem(line)
+        XCTAssertNotNil(item)
+        XCTAssertEqual(item?.id, "5")
+        XCTAssertEqual(item?.state, "done")
+        XCTAssertEqual(item?.engine, "piper")
+        XCTAssertEqual(item?.voice, "faber")
+        XCTAssertEqual(item?.rate, "330")
+        XCTAssertEqual(item?.finishedAt, "1780000000")
+        XCTAssertEqual(item?.text, "Olá mundo")
+    }
+
+    func testParseHistoryItemHandlesTabInText() {
+        // Daemon sanitizes \t out of text, but parser should still
+        // gracefully join the trailing fields with \t.
+        let line = "ITEM\t9\tskipped\tsay\tLuciana\t330\t0\thello\textra"
+        let item = SocketClient.parseHistoryItem(line)
+        XCTAssertEqual(item?.text, "hello\textra")
+    }
+
+    func testParseHistoryItemRejectsShortLines() {
+        // 6 columns isn't enough — finished_at missing.
+        XCTAssertNil(SocketClient.parseHistoryItem("ITEM\t1\tdone\tpiper\tfaber\t330\tboo"))
+        XCTAssertNil(SocketClient.parseHistoryItem("ITEM\t1"))
+        XCTAssertNil(SocketClient.parseHistoryItem("NOTITEM\t1\tdone\tpiper\tfaber\t330\t0\ttext"))
+    }
 }
 #endif

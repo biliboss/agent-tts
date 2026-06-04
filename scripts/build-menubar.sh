@@ -11,7 +11,7 @@
 #
 # Output: ui/menubar/build/AgentTTSMenubar.app
 #
-# v1.10.1: bundles AppIcon.icns generated from public/logos/agent-tts-logo.png.
+# v1.10.2: bundles AppIcon.icns generated from public/logos/agent-tts-logo.png.
 # Codesigning + notarization are still out of scope — Gatekeeper treats the
 # unsigned bundle as "from unidentified developer". v1.10.2 wires brew cask.
 
@@ -46,7 +46,7 @@ mkdir -p "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 
-# v1.10.1: bake AppIcon.icns from the marketing logo (1024 RGBA → sips →
+# v1.10.2: bake AppIcon.icns from the marketing logo (1024 RGBA → sips →
 # iconutil). Requires `sips` + `iconutil` (macOS native).
 LOGO="$REPO_ROOT/public/logos/agent-tts-logo.png"
 if [ -f "$LOGO" ]; then
@@ -76,8 +76,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>io.github.biliboss.agent-tts.menubar</string>
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>agent-tts</string>
-  <key>CFBundleVersion</key><string>1.10.1</string>
-  <key>CFBundleShortVersionString</key><string>1.10.1</string>
+  <key>CFBundleVersion</key><string>1.10.2</string>
+  <key>CFBundleShortVersionString</key><string>1.10.2</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>

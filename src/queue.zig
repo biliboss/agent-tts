@@ -90,6 +90,22 @@ pub const PoppedItem = struct {
     text: []u8,
 };
 
+/// v1.10.2 — one row returned by `history`. Mirrors PoppedItem but
+/// includes the terminal state and finish timestamp so the menubar/client
+/// can render a played-history list. `lang` defaults to .auto on read
+/// because we don't persist it (queue.zig has never written that column).
+pub const HistoryItem = struct {
+    id: u64,
+    state: State,
+    engine: ipc.Engine,
+    voice: []const u8,
+    rate: u32,
+    /// Seconds since epoch (the `finished_at` column). 0 when the item is
+    /// still pending/playing (HISTORY includes those too for live UI).
+    finished_at: i64,
+    text: []const u8,
+};
+
 const SCHEMA =
     \\CREATE TABLE IF NOT EXISTS items (
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -341,6 +357,104 @@ pub const Queue = struct {
         _ = c.sqlite3_finalize(stmt);
         if (rc != c.SQLITE_DONE) return 0;
         return @intCast(c.sqlite3_changes64(q.db));
+    }
+
+    /// v1.10.2 — SELECT the last `limit` rows regardless of state. Most
+    /// recent first. Used by the new `HISTORY` IPC op and the `agent-tts
+    /// history` client subcommand. Slices live in `arena` so callers can
+    /// release everything by dropping the arena.
+    ///
+    /// We clamp `limit` at 100 to keep the worst-case response a few KB,
+    /// matching the daemon's WRITE_BUF budget. The IPC layer re-applies
+    /// this clamp at parse time but having it here too keeps the function
+    /// safe when called from tests without IPC.
+    pub fn history(q: *Queue, io: std.Io, arena: std.mem.Allocator, limit: usize) ![]HistoryItem {
+        q.mu.lockUncancelable(io);
+        defer q.mu.unlock(io);
+
+        const clamped: usize = if (limit == 0) 20 else @min(limit, 100);
+
+        // SELECT in DESC order (newest first); the client/menubar render
+        // top-to-bottom. LIMIT is bound rather than substituted so the
+        // statement plan cache stays warm across calls.
+        const sql = "SELECT id, state, voice, rate, text, engine, COALESCE(finished_at, 0) FROM items ORDER BY id DESC LIMIT ?;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DbPrepare;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt, 1, @intCast(clamped)) != c.SQLITE_OK) return error.DbBind;
+
+        var out: std.ArrayList(HistoryItem) = .empty;
+        defer out.deinit(arena);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const id: u64 = @intCast(c.sqlite3_column_int64(stmt, 0));
+            const state_s = try colText(arena, stmt, 1);
+            const voice = try colText(arena, stmt, 2);
+            const rate: u32 = @intCast(c.sqlite3_column_int(stmt, 3));
+            const text = try colText(arena, stmt, 4);
+            const engine_s = try colText(arena, stmt, 5);
+            const finished_at: i64 = c.sqlite3_column_int64(stmt, 6);
+            try out.append(arena, .{
+                .id = id,
+                .state = State.fromStr(state_s) orelse .done,
+                .engine = ipc.Engine.fromStr(engine_s) orelse .say,
+                .voice = voice,
+                .rate = rate,
+                .finished_at = finished_at,
+                .text = text,
+            });
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// v1.10.2 — replay item `src_id`: INSERT a copy with the same engine /
+    /// voice / rate / ssml / text but state='pending' and a fresh
+    /// enqueued_at. Returns the new id, or null when no row matches.
+    /// Signals the worker so it picks up the new pending item immediately.
+    ///
+    /// Implementation is a SELECT → INSERT pair rather than `INSERT … SELECT`
+    /// so we can capture the source row first (and return null cleanly
+    /// when missing). Both steps happen under `q.mu` so a concurrent
+    /// clearPending can't yank the row mid-copy.
+    pub fn replay(q: *Queue, io: std.Io, gpa: std.mem.Allocator, src_id: u64) !?u64 {
+        q.mu.lockUncancelable(io);
+        defer q.mu.unlock(io);
+
+        // Look up source row.
+        const sql_sel = "SELECT text, voice, rate, engine, ssml FROM items WHERE id=?;";
+        var sel: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql_sel, -1, &sel, null) != c.SQLITE_OK) return error.DbPrepare;
+        defer _ = c.sqlite3_finalize(sel);
+        if (c.sqlite3_bind_int64(sel, 1, @intCast(src_id)) != c.SQLITE_OK) return error.DbBind;
+
+        const rc = c.sqlite3_step(sel);
+        if (rc != c.SQLITE_ROW) return null;
+
+        const text = try colText(gpa, sel, 0);
+        defer gpa.free(text);
+        const voice = try colText(gpa, sel, 1);
+        defer gpa.free(voice);
+        const rate: u32 = @intCast(c.sqlite3_column_int(sel, 2));
+        const engine_buf = try colText(gpa, sel, 3);
+        defer gpa.free(engine_buf);
+        const ssml_flag: c_int = c.sqlite3_column_int(sel, 4);
+
+        // INSERT the copy.
+        const sql_ins = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml) VALUES (?,?,?,'pending',?,?,?);";
+        var ins: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(q.db, sql_ins, -1, &ins, null) != c.SQLITE_OK) return error.DbPrepare;
+        defer _ = c.sqlite3_finalize(ins);
+
+        if (c.sqlite3_bind_text(ins, 1, text.ptr, @intCast(text.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_text(ins, 2, voice.ptr, @intCast(voice.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_int(ins, 3, @intCast(rate)) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_int64(ins, 4, nowEpoch(io)) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_text(ins, 5, engine_buf.ptr, @intCast(engine_buf.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_bind_int(ins, 6, ssml_flag) != c.SQLITE_OK) return error.DbBind;
+        if (c.sqlite3_step(ins) != c.SQLITE_DONE) return error.DbStep;
+
+        const new_id: u64 = @intCast(c.sqlite3_last_insert_rowid(q.db));
+        q.cond.signal(io);
+        return new_id;
     }
 
     pub fn close(q: *Queue, io: std.Io) void {

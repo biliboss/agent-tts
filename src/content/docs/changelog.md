@@ -9,6 +9,52 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10.2 — History + pause/resume + floating player · 2026-06-03
+
+**Why**: v1.10 shipped a one-shot enqueue UI — once an item left the queue, it was gone. No way to pause mid-utterance, no way to replay a past message, no always-on-top widget surfacing what's currently playing. v1.10.2 turns agent-tts into a proper voice player: persistent history, mid-playback pause/resume, replay any past item by id, and a floating overlay panel on macOS that shows the active item plus controls. Same four ops surface through CLI, MCP, and the menubar overlay.
+
+**Shipped — daemon (Zig)**:
+
+- `src/audio.zig` — `AudioPlayer.pause()` / `resume_play()` / `is_paused()` driving zaudio's `sound.stop()`/`sound.start()`. The streamS16le wait loop now stays parked (20 ms nanosleep) while paused instead of exiting on `isAtEnd`. `paused_at_ns` atomic latches/clears for elapsed accounting. Two new unit tests cover the state machine without sound (headless CI safe). `current_sound` atomic slot lets the IPC thread reach the active sound without dragging a mutex into the audio hot path.
+- `src/ipc.zig` — 4 new ops: `PAUSE`, `RESUME`, `REPLAY\t<id>`, `HISTORY\t<limit>`. `Op` enum grows from 4 → 8. Backward-compat: every existing v0.6/v0.7/v1.1/v1.8 request shape still parses (8 round-trip tests cover it). 8 new parser tests including malformed/clamp/zero-default cases.
+- `src/queue.zig` — `Queue.history(limit)` (SELECT … ORDER BY id DESC LIMIT, clamped to 100) returning a new `HistoryItem` carrying `finished_at`. `Queue.replay(id)` does a SELECT/INSERT pair under `q.mu` returning the new row id (or null when the source id is gone). Schema unchanged — rows already persist post-completion since v0.3 WAL.
+- `src/daemon.zig` — `Resources.current_playing_id` atomic published by the worker loop on each pop, cleared on completion. `handleClient` dispatches the four new ops via `Resources` (the signature changed from `(queue, audio_player)` to `(res)`). PAUSE/RESUME ack `OK\t<id>` from `current_playing_id`; ERR with "nothing playing" / "not paused" / "item not found" otherwise. HISTORY emits `ITEM\t<id>\t<state>\t<engine>\t<voice>\t<rate>\t<finished_at>\t<text>` (one extra column vs QUEUE).
+- `src/client.zig` — 4 new subcommands (`pause`, `resume`, `replay <id>`, `history [--limit N]`). 4 new reusable silent helpers (`pauseOp`, `resumeOp`, `replayOp`, `historyLines`) consumed by mcp.zig and the menubar.
+- `src/mcp.zig` — tools list **6 → 10** (added `pause`, `resume`, `replay`, `history`). VERSION bumped 1.8.0 → 1.10.2. `tools/list` test updated to expect exactly 10 names in the documented order.
+
+**Shipped — menubar (Swift)**:
+
+- `ui/menubar/Sources/AgentTTSMenubar/FloatingPlayer.swift` (NEW, 187 LOC) — `NSPanel` with `level = .floating` + `.hudWindow` style + `.canJoinAllSpaces`. Compact 320×60 panel: current item text (1-line truncated), engine·voice·rate badge, pause/resume toggle (SF Symbol switches `pause.fill`↔`play.fill`), skip, replay buttons. Frame persists to `UserDefaults` under `AgentTTSMenubar.floatingFrame` (NSStringFromRect); drag handle works via `isMovableByWindowBackground`. The `FloatingPlayerModel` is a published-property view-model; `FloatingPlayerController.enabled` is the toggle persisted under `AgentTTSMenubar.floatingPlayerEnabled` (default OFF — upgrades from v1.10.1 don't surprise anyone).
+- `ui/menubar/Sources/AgentTTSMenubar/AppDelegate.swift` — 750 ms `Timer` polls `agent-tts queue` continuously (regardless of popover state). When a `state=="playing"` row appears AND the user toggled the widget on, the panel shows; when the queue empties or no playing row, it hides.
+- `ui/menubar/Sources/AgentTTSMenubar/VoicePicker.swift` — settings row gains a "Show floating player while speaking" SwiftUI `Toggle` mirroring `FloatingPlayerController.enabled`.
+- `ui/menubar/Sources/AgentTTSMenubarCore/SocketClient.swift` — `pause()`, `resumePlayback()`, `replay(id:)`, `history(limit:)`, plus a `HistoryItem` Sendable struct + `parseHistoryItem` (7-column wire shape). 4 new XCTest cases + 4 new `SocketProtocolCheck` assertions (Xcode-free smoke runs).
+
+**Live validation (this session, real measurements)**:
+
+- `zig build -Doptimize=ReleaseFast -Dwith-piper=true` clean (1.3 MB binary)
+- `zig build test` green (all suites: ipc gains 8 tests, audio gains 2)
+- New binary `cp`'d to `/opt/homebrew/bin/agent-tts` + `codesign --force --sign -` + `launchctl kickstart -k gui/$UID/io.github.biliboss.agent-tts`
+- Enqueue → wait 2 s → `agent-tts pause` → daemon ack `paused id=100` → audio actually stopped (verified by ear during 3 s pause window) → `agent-tts resume` → daemon ack `resumed id=100` → audio resumed from the exact spot
+- `agent-tts history --limit 5` → 5 rows of real data printed with `finished_at` epoch column populated
+- `agent-tts replay 99` → daemon ack `replayed id=99 as new id=101` → row 101 immediately appeared in `queue` as `playing` with the same text
+- `agent-tts replay 999999` → daemon ack `ERR\titem not found` → client exits 1
+- `agent-tts pause` while idle → `ERR\tnothing playing` (exit 1); `agent-tts resume` while idle → `ERR\tnot paused`
+- MCP `tools/list` over stdio (real JSON-RPC handshake) returned exactly 10 tool descriptors with the v1.10.2 four prepended after `say_stream`
+- MCP `tools/call` for `history(limit=3)` returned 3 most-recent items with `finished_at` populated; `pause` while idle returned `daemon error` (isError=true); `pause` while playing returned `{"paused_id":102}` (isError=false)
+- `bash scripts/build-menubar.sh` → bundle 1.10.2 → installed `/Applications/AgentTTSMenubar.app` → launched → enqueued long item → **floating widget appeared at bottom-left of screen** with title "agent-tts", playing text, and pause/skip/replay controls. Screenshot saved to `_qa/v1.10.2-floating-player-full.png`.
+- Settings persistence: `defaults read io.github.biliboss.agent-tts.menubar AgentTTSMenubar.floatingPlayerEnabled` returned `1` after toggle.
+
+**Honest scope deferred**:
+
+- **`say` engine pause/resume** — separate process; would need SIGSTOP/SIGCONT plumbing. Today PAUSE only acts on the piper/cloned path (which is the default engine). PAUSE while a `say` item is playing returns OK (ack) but the audio doesn't actually halt because `say` runs out-of-process. v1.10.3 candidate.
+- **Replay preserves engine but not lang** — the queue schema never persisted Message.lang (existed only in-flight on ENQUEUE since v1.1). Replay copies engine/voice/rate/ssml/text but lang re-detects per chunk. Identical observable behaviour for 99% of inputs; flagging for transparency.
+- **Floating widget drag persists, but multi-display position validation not done** this session — frame is saved/loaded but I only tested on the primary display.
+- **Bundle codesign** is still ad-hoc (`-` identity). v1.10.3 wires brew cask + notarization.
+
+**Lead-time**: `_qa/v1.10.2-leadtime.md` carries `agent_start_ts` + `commit_ts` + elapsed seconds.
+
+---
+
 ## v1.10.1 — Patch (playground fix + menubar icon + live screenshot) · 2026-06-03
 
 **Why a patch:** the v1.9 playground page deployed to GitHub Pages was non-interactive — `<script is:inline>` + `<style>` inside an MDX template literal got stripped/mangled in production. Spotted live by the user after merge. v1.10 had landed without re-validating v1.9's deploy. New rule (saved to `feedback-ship-only-tested.md` in `_memory/`): "shipped" requires end-to-end live-URL validation, not just `npm run build` green.

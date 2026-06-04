@@ -34,6 +34,10 @@ const HELP =
     \\  agent-tts queue                  list pending + playing items
     \\  agent-tts skip                   skip the current playing item
     \\  agent-tts clear                  drop all pending items
+    \\  agent-tts pause                  pause active playback (v1.10.2)
+    \\  agent-tts resume                 resume paused playback (v1.10.2)
+    \\  agent-tts replay <id>            re-enqueue a past item (v1.10.2)
+    \\  agent-tts history [--limit N]    list last N items, any state (v1.10.2)
     \\  agent-tts daemon                 run daemon (foreground)
     \\
     \\Options (for enqueue):
@@ -50,12 +54,17 @@ const HELP =
 
 pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
     // Subcommand dispatch (only when not paired with a flag — `queue`,
-    // `skip`, `clear` take no args).
+    // `skip`, `clear`, `pause`, `resume`, `history` take no/few args).
     if (args.len >= 2) {
         const sub = args[1];
         if (std.mem.eql(u8, sub, "queue")) return cmdQueue(arena, io, home);
         if (std.mem.eql(u8, sub, "skip")) return cmdSkip(arena, io, home);
         if (std.mem.eql(u8, sub, "clear")) return cmdClear(arena, io, home);
+        // v1.10.2 — player ops.
+        if (std.mem.eql(u8, sub, "pause")) return cmdPause(arena, io, home);
+        if (std.mem.eql(u8, sub, "resume")) return cmdResume(arena, io, home);
+        if (std.mem.eql(u8, sub, "replay")) return cmdReplay(arena, io, home, args);
+        if (std.mem.eql(u8, sub, "history")) return cmdHistory(arena, io, home, args);
     }
     return cmdEnqueue(arena, io, home, args);
 }
@@ -288,6 +297,125 @@ fn cmdClear(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
     }
 }
 
+// v1.10.2 — pause/resume CLI ops. Both ack `OK\t<id>` of the active item
+// or print the daemon's ERR reason verbatim ("nothing playing" / "not
+// paused" / "item not found").
+fn cmdPause(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
+    const line = try simpleOp(arena, io, home, "PAUSE\n");
+    if (std.mem.startsWith(u8, line, "OK\t")) {
+        std.debug.print("[agent-tts] paused id={s}\n", .{line[3..]});
+    } else if (std.mem.startsWith(u8, line, "ERR\t")) {
+        std.debug.print("[agent-tts] {s}\n", .{line[4..]});
+        std.process.exit(1);
+    } else {
+        std.debug.print("[agent-tts] unexpected: {s}\n", .{line});
+        std.process.exit(1);
+    }
+}
+
+fn cmdResume(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
+    const line = try simpleOp(arena, io, home, "RESUME\n");
+    if (std.mem.startsWith(u8, line, "OK\t")) {
+        std.debug.print("[agent-tts] resumed id={s}\n", .{line[3..]});
+    } else if (std.mem.startsWith(u8, line, "ERR\t")) {
+        std.debug.print("[agent-tts] {s}\n", .{line[4..]});
+        std.process.exit(1);
+    } else {
+        std.debug.print("[agent-tts] unexpected: {s}\n", .{line});
+        std.process.exit(1);
+    }
+}
+
+fn cmdReplay(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("usage: agent-tts replay <id>\n", .{});
+        std.process.exit(2);
+    }
+    const id = std.fmt.parseInt(u64, args[2], 10) catch {
+        std.debug.print("error: replay id must be an integer (got '{s}')\n", .{args[2]});
+        std.process.exit(2);
+    };
+    const cmd = try std.fmt.allocPrint(arena, "REPLAY\t{d}\n", .{id});
+    const line = try simpleOp(arena, io, home, cmd);
+    if (std.mem.startsWith(u8, line, "OK\t")) {
+        std.debug.print("[agent-tts] replayed id={d} as new id={s}\n", .{ id, line[3..] });
+    } else if (std.mem.startsWith(u8, line, "ERR\t")) {
+        std.debug.print("[agent-tts] {s}\n", .{line[4..]});
+        std.process.exit(1);
+    } else {
+        std.debug.print("[agent-tts] unexpected: {s}\n", .{line});
+        std.process.exit(1);
+    }
+}
+
+// v1.10.2 — history listing. Default limit 20, max 100 (daemon clamps).
+// Wire shape is ITEM\t<id>\t<state>\t<engine>\t<voice>\t<rate>\t<finished_at>\t<text>.
+fn cmdHistory(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []const []const u8) !void {
+    var limit: u32 = 20;
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--limit")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --limit needs value\n", .{});
+                std.process.exit(2);
+            }
+            limit = std.fmt.parseInt(u32, args[i], 10) catch {
+                std.debug.print("error: --limit invalid (got '{s}')\n", .{args[i]});
+                std.process.exit(2);
+            };
+        }
+    }
+    var stream = try openSocket(arena, io, home);
+    defer stream.close(io);
+
+    var read_buf: [READ_BUF]u8 = undefined;
+    var write_buf: [128]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var sw = stream.writer(io, &write_buf);
+
+    try sw.interface.print("HISTORY\t{d}\n", .{limit});
+    try sw.interface.flush();
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
+    var w = &stdout.interface;
+
+    var n_items: u32 = 0;
+    while (true) {
+        const raw = try sr.interface.takeDelimiterInclusive('\n');
+        const line = if (raw.len > 0 and raw[raw.len - 1] == '\n') raw[0 .. raw.len - 1] else raw;
+        if (std.mem.eql(u8, line, "END")) break;
+        if (std.mem.startsWith(u8, line, "ERR\t")) {
+            std.debug.print("[agent-tts] daemon error: {s}\n", .{line[4..]});
+            std.process.exit(1);
+        }
+        if (!std.mem.startsWith(u8, line, "ITEM\t")) continue;
+        const rest = line[5..];
+        var it = std.mem.splitScalar(u8, rest, '\t');
+        const id = it.next() orelse continue;
+        const state = it.next() orelse continue;
+        const engine = it.next() orelse continue;
+        const voice = it.next() orelse continue;
+        const rate = it.next() orelse continue;
+        const finished = it.next() orelse continue;
+        const text = it.rest();
+        if (n_items == 0) {
+            try w.writeAll("  id  state    engine  voice                  rate  finished     text\n");
+        }
+        try w.print("  {s:>4}  {s:<8} {s:<6}  {s:<22} {s:>4}  {s:>10}  {s}\n", .{
+            id, state, engine, voice, rate, finished, text,
+        });
+        n_items += 1;
+    }
+    if (n_items == 0) {
+        try w.writeAll("(no history yet)\n");
+    } else {
+        try w.print("{d} item(s)\n", .{n_items});
+    }
+    try w.flush();
+}
+
 fn simpleOp(arena: std.mem.Allocator, io: std.Io, home: []const u8, cmd: []const u8) ![]u8 {
     var stream = try openSocket(arena, io, home);
     defer stream.close(io);
@@ -482,6 +610,112 @@ pub fn clearOp(arena: std.mem.Allocator, io: std.Io, home: []const u8) !u64 {
     const line = try simpleOpSilent(arena, io, home, "CLEAR\n");
     if (!std.mem.startsWith(u8, line, "OK\t")) return error.UnexpectedResponse;
     return std.fmt.parseInt(u64, line[3..], 10) catch return error.UnexpectedResponse;
+}
+
+/// v1.10.2 — pause the active item. Returns the paused id, or 0 when
+/// the daemon reports "nothing playing". Other ERRs surface as
+/// DaemonError. Used by mcp.zig and the menubar FloatingPlayer.
+pub fn pauseOp(arena: std.mem.Allocator, io: std.Io, home: []const u8) !u64 {
+    const line = try simpleOpSilent(arena, io, home, "PAUSE\n");
+    if (std.mem.startsWith(u8, line, "OK\t")) {
+        return std.fmt.parseInt(u64, line[3..], 10) catch return error.UnexpectedResponse;
+    }
+    if (std.mem.startsWith(u8, line, "ERR\t")) {
+        // "nothing playing" → return 0 so callers can render a friendly
+        // empty-state without an error path. Anything else is a real error.
+        if (std.mem.indexOf(u8, line, "nothing playing") != null) return 0;
+        return error.DaemonError;
+    }
+    return error.UnexpectedResponse;
+}
+
+/// v1.10.2 — resume the paused item. Same shape as pauseOp.
+pub fn resumeOp(arena: std.mem.Allocator, io: std.Io, home: []const u8) !u64 {
+    const line = try simpleOpSilent(arena, io, home, "RESUME\n");
+    if (std.mem.startsWith(u8, line, "OK\t")) {
+        return std.fmt.parseInt(u64, line[3..], 10) catch return error.UnexpectedResponse;
+    }
+    if (std.mem.startsWith(u8, line, "ERR\t")) {
+        if (std.mem.indexOf(u8, line, "not paused") != null) return 0;
+        return error.DaemonError;
+    }
+    return error.UnexpectedResponse;
+}
+
+/// v1.10.2 — replay an item by id. Returns the new pending id, or 0 when
+/// the daemon reports "item not found".
+pub fn replayOp(arena: std.mem.Allocator, io: std.Io, home: []const u8, src_id: u64) !u64 {
+    const cmd = try std.fmt.allocPrint(arena, "REPLAY\t{d}\n", .{src_id});
+    const line = try simpleOpSilent(arena, io, home, cmd);
+    if (std.mem.startsWith(u8, line, "OK\t")) {
+        return std.fmt.parseInt(u64, line[3..], 10) catch return error.UnexpectedResponse;
+    }
+    if (std.mem.startsWith(u8, line, "ERR\t")) {
+        if (std.mem.indexOf(u8, line, "item not found") != null) return 0;
+        return error.DaemonError;
+    }
+    return error.UnexpectedResponse;
+}
+
+/// v1.10.2 — single history row returned by `historyLines`. Mirrors
+/// `client.zig`'s `QueueItem` shape but with the extra finished_at field.
+pub const HistoryItem = struct {
+    id: []const u8,
+    state: []const u8,
+    engine: []const u8,
+    voice: []const u8,
+    rate: []const u8,
+    finished_at: []const u8,
+    text: []const u8,
+};
+
+/// v1.10.2 — fetch the last `limit` items via HISTORY. limit clamped to
+/// 100 by the daemon. Slices owned by `arena`.
+pub fn historyLines(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    limit: u32,
+) ![]HistoryItem {
+    var stream = try openSocketSilent(arena, io, home);
+    defer stream.close(io);
+
+    var read_buf: [READ_BUF]u8 = undefined;
+    var write_buf: [128]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var sw = stream.writer(io, &write_buf);
+
+    try sw.interface.print("HISTORY\t{d}\n", .{limit});
+    try sw.interface.flush();
+
+    var list: std.ArrayList(HistoryItem) = .empty;
+    while (true) {
+        const raw = try sr.interface.takeDelimiterInclusive('\n');
+        const line = if (raw.len > 0 and raw[raw.len - 1] == '\n') raw[0 .. raw.len - 1] else raw;
+        if (std.mem.eql(u8, line, "END")) break;
+        if (std.mem.startsWith(u8, line, "ERR\t")) return error.DaemonError;
+        if (!std.mem.startsWith(u8, line, "ITEM\t")) continue;
+
+        const rest = line[5..];
+        var it = std.mem.splitScalar(u8, rest, '\t');
+        const id = it.next() orelse continue;
+        const state = it.next() orelse continue;
+        const engine = it.next() orelse continue;
+        const voice = it.next() orelse continue;
+        const rate = it.next() orelse continue;
+        const finished = it.next() orelse continue;
+        const text = it.rest();
+        try list.append(arena, .{
+            .id = try arena.dupe(u8, id),
+            .state = try arena.dupe(u8, state),
+            .engine = try arena.dupe(u8, engine),
+            .voice = try arena.dupe(u8, voice),
+            .rate = try arena.dupe(u8, rate),
+            .finished_at = try arena.dupe(u8, finished),
+            .text = try arena.dupe(u8, text),
+        });
+    }
+    return list.toOwnedSlice(arena);
 }
 
 fn simpleOpSilent(arena: std.mem.Allocator, io: std.Io, home: []const u8, cmd: []const u8) ![]u8 {

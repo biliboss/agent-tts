@@ -104,5 +104,29 @@ check(engines.contains("say") && engines.contains("piper"),
 let empty = VoiceCatalog.clonedVoices(home: "/tmp/agent-tts-test-nonexistent-\(UUID().uuidString)")
 check(empty.isEmpty, "VoiceCatalog clonedVoices returns [] on fake home")
 
+// MARK: - v1.10.2 parseHistoryItem
+
+if let item = SocketClient.parseHistoryItem("ITEM\t5\tdone\tpiper\tfaber\t330\t1780000000\tOlá mundo") {
+    check(item.id == "5" && item.state == "done" && item.engine == "piper"
+          && item.voice == "faber" && item.rate == "330"
+          && item.finishedAt == "1780000000" && item.text == "Olá mundo",
+          "parseHistoryItem happy path (v1.10.2)")
+} else {
+    fputs("FAIL: parseHistoryItem returned nil\n", stderr)
+    exit(1)
+}
+
+if let item = SocketClient.parseHistoryItem("ITEM\t9\tskipped\tsay\tLuciana\t330\t0\thello\textra") {
+    check(item.text == "hello\textra", "parseHistoryItem keeps embedded tabs in text")
+} else {
+    fputs("FAIL: parseHistoryItem embedded tabs returned nil\n", stderr)
+    exit(1)
+}
+
+check(SocketClient.parseHistoryItem("ITEM\t1\tdone\tpiper\tfaber\t330\tboo") == nil,
+      "parseHistoryItem rejects 6-column row (missing finished_at)")
+check(SocketClient.parseHistoryItem("ITEM\t1") == nil,
+      "parseHistoryItem rejects very short row")
+
 print("---")
 print("All SocketProtocolCheck assertions passed.")
