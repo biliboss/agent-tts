@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// SSML 1.1 subset parser + per-engine transpile. v1.8.
+// SSML 1.1 subset parser + per-engine transpile. v1.8 (+v1.10.12).
 //
 // Scope. Accept a tiny subset of the W3C SSML 1.1 spec so agents can
 // inflect Pt-BR Faber + macOS `say`:
@@ -8,9 +8,19 @@
 //   <break time="500ms" />        — or strength="weak|medium|strong"
 //   <prosody rate="…" pitch="…" volume="…">…</prosody>
 //   <say-as interpret-as="…">…</say-as>
+//   <phoneme alphabet="ipa" ph="…">…</phoneme>     — v1.10.12
+//   <sub alias="…">…</sub>                         — v1.10.12
 //
 // Anything else (unknown tag, malformed XML, stray `<`) falls back to a
 // `.text` token carrying the raw bytes — we never crash on agent garbage.
+//
+// v1.10.12: `<phoneme>` lets agents force IPA pronunciation for brand
+// names (Anthropic, Mistral) by passing the raw IPA string in `ph`. Piper
+// path emits an espeak-ng `[[ipa]]` directive that the libpiper phonemizer
+// honours; `say` strips the tag (macOS has no IPA passthrough) and falls
+// back to the body text. `<sub>` rewrites the body text to the alias at
+// preproc time so code identifiers like `getConditioningLatents` can be
+// said as "get conditioning latents" without a glossary entry.
 //
 // Why this shape. The parser is a flat token stream, not a tree. The day
 // the daemon needs nested prosody it walks the stream and tracks a small
@@ -98,6 +108,24 @@ pub const SayAs = struct {
     open: bool,
 };
 
+/// v1.10.12 — `<phoneme alphabet="ipa" ph="ˌæn.θɹəˈpɪk">Anthropic</phoneme>`.
+/// `alphabet` defaults to "ipa" when omitted (only IPA is wired in v1.10.12;
+/// x-sampa / x-microsoft are documented as "passed through, engine-decided").
+/// `ph` is the phoneme string the engine should pronounce instead of the
+/// body text. Body text rides on `.text` tokens between open/close so that
+/// engines without IPA support (say) can still emit something legible.
+pub const Phoneme = struct {
+    alphabet: []const u8,
+    ph: []const u8,
+};
+
+/// v1.10.12 — `<sub alias="…">…</sub>`. Body text is replaced by `alias`
+/// at preproc time. Used for code identifiers / abbreviations where the
+/// displayed form differs from the spoken form.
+pub const Sub = struct {
+    alias: []const u8,
+};
+
 pub const Token = union(enum) {
     text: []const u8,
     emphasis_open: Emphasis,
@@ -107,6 +135,17 @@ pub const Token = union(enum) {
     prosody_close,
     sayas_open: SayAs,
     sayas_close,
+    /// v1.10.12 — phoneme open carries alphabet + ph. The walker emits the
+    /// IPA passthrough directive on open; body text between open/close is
+    /// suppressed for engines that honour the directive (piper) but used as
+    /// fallback by engines that don't (say). Close has no payload.
+    phoneme_open: Phoneme,
+    phoneme_close,
+    /// v1.10.12 — sub open carries the alias. The walker emits the alias
+    /// as a synthetic `.text` token at open and suppresses body text until
+    /// close so the displayed form never reaches the engine.
+    sub_open: Sub,
+    sub_close,
 };
 
 pub const ParseError = error{OutOfMemory};
@@ -213,6 +252,26 @@ pub fn parse(arena: std.mem.Allocator, input: []const u8) ParseError![]Token {
                         if (is_self_closing) try out.append(arena, .sayas_close);
                     }
                 },
+                .phoneme => {
+                    if (is_closing) {
+                        try out.append(arena, .phoneme_close);
+                    } else {
+                        const attrs = tag_body[name_end..name_end_search];
+                        const alphabet = attrValue(attrs, "alphabet") orelse "ipa";
+                        const ph = attrValue(attrs, "ph") orelse "";
+                        try out.append(arena, .{ .phoneme_open = .{ .alphabet = alphabet, .ph = ph } });
+                        if (is_self_closing) try out.append(arena, .phoneme_close);
+                    }
+                },
+                .sub => {
+                    if (is_closing) {
+                        try out.append(arena, .sub_close);
+                    } else {
+                        const alias = attrValue(tag_body[name_end..name_end_search], "alias") orelse "";
+                        try out.append(arena, .{ .sub_open = .{ .alias = alias } });
+                        if (is_self_closing) try out.append(arena, .sub_close);
+                    }
+                },
             }
         } else {
             // Unknown tag — pass through verbatim. Agents sometimes emit
@@ -230,13 +289,15 @@ pub fn parse(arena: std.mem.Allocator, input: []const u8) ParseError![]Token {
     return out.toOwnedSlice(arena);
 }
 
-const TagKind = enum { emphasis, @"break", prosody, sayas };
+const TagKind = enum { emphasis, @"break", prosody, sayas, phoneme, sub };
 
 fn recognize(name: []const u8) ?TagKind {
     if (std.mem.eql(u8, name, "emphasis")) return .emphasis;
     if (std.mem.eql(u8, name, "break")) return .@"break";
     if (std.mem.eql(u8, name, "prosody")) return .prosody;
     if (std.mem.eql(u8, name, "say-as")) return .sayas;
+    if (std.mem.eql(u8, name, "phoneme")) return .phoneme;
+    if (std.mem.eql(u8, name, "sub")) return .sub;
     return null;
 }
 
@@ -379,11 +440,17 @@ pub fn transpileToSay(arena: std.mem.Allocator, tokens: []const Token) ![]u8 {
     // we issue [[rset]] to drop back to defaults (cheaper than maintaining
     // a true stack — nested prosody is rare in agent output).
     var prosody_depth: u32 = 0;
+    // v1.10.12 — suppress body text inside `<sub>` (alias takes its place)
+    // and inside `<phoneme>` (the body text is the displayed form, the
+    // alphabet+ph attrs are what gets spoken on engines that honour them;
+    // for `say` we can't honour the IPA but DO want the body text — only
+    // the `<sub>` body is fully replaced). We track `sub_depth` only.
+    var sub_depth: u32 = 0;
 
     for (tokens) |tok| {
         switch (tok) {
             .text => |t| {
-                try out.appendSlice(arena, t);
+                if (sub_depth == 0) try out.appendSlice(arena, t);
             },
             .emphasis_open => |e| {
                 // Emphasis on say: gentle volume bump + slight rate boost.
@@ -451,6 +518,23 @@ pub fn transpileToSay(arena: std.mem.Allocator, tokens: []const Token) ![]u8 {
             .sayas_close => {
                 try out.appendSlice(arena, " [[char NORM]] ");
             },
+            // v1.10.12 — `<phoneme>` on macOS `say`: macOS has no IPA
+            // directive in the public [[…]] vocabulary. We strip the tag
+            // silently and let the body text fall through. The body text
+            // already follows in subsequent `.text` tokens.
+            .phoneme_open, .phoneme_close => {},
+            // v1.10.12 — `<sub alias="…">`: emit the alias verbatim and
+            // suppress body text via the same depth-tracked walker pattern
+            // we use for prosody. Implement here as: open emits the alias,
+            // close does nothing — the walker filters body text by maintaining
+            // a `sub_depth` counter outside this switch (added below).
+            .sub_open => |s| {
+                try out.appendSlice(arena, s.alias);
+                sub_depth += 1;
+            },
+            .sub_close => {
+                if (sub_depth > 0) sub_depth -= 1;
+            },
         }
     }
 
@@ -459,15 +543,28 @@ pub fn transpileToSay(arena: std.mem.Allocator, tokens: []const Token) ![]u8 {
 
 /// Strip SSML tags, leaving only plain text. Used by engines that don't
 /// support SSML at all (piper without per-chunk prosody, espeak-ng).
+///
+/// v1.10.12: `<sub alias="…">body</sub>` emits the alias (the spoken form),
+/// not the body. `<phoneme ph="ipa">body</phoneme>` emits the body text
+/// (the displayed form) — strip-to-plain is the engine-agnostic fallback,
+/// and the body text is what listeners expect when IPA isn't honoured.
 pub fn stripToPlain(arena: std.mem.Allocator, tokens: []const Token) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
+    var sub_depth: u32 = 0;
     for (tokens) |tok| {
         switch (tok) {
-            .text => |t| try out.appendSlice(arena, t),
+            .text => |t| if (sub_depth == 0) try out.appendSlice(arena, t),
             .@"break" => |b| {
                 // Surface breaks as ". " so the downstream pause stage in
                 // preproc.zig at least inserts an [[slnc]].
                 if (b.ms >= 250) try out.appendSlice(arena, ". ");
+            },
+            .sub_open => |s| {
+                try out.appendSlice(arena, s.alias);
+                sub_depth += 1;
+            },
+            .sub_close => {
+                if (sub_depth > 0) sub_depth -= 1;
             },
             else => {},
         }
@@ -642,4 +739,94 @@ test "stripToPlain drops tags keeps text + sentence break" {
     const toks = try parse(arena.allocator(), "<prosody rate=\"slow\">olá <break time=\"500ms\"/>mundo</prosody>");
     const out = try stripToPlain(arena.allocator(), toks);
     try testing.expectEqualStrings("olá . mundo", out);
+}
+
+// ─── v1.10.12 — phoneme + sub parse + transpile ────────────────────────
+
+test "v1.10.12 parse phoneme with alphabet and ph" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try parse(
+        arena.allocator(),
+        "<phoneme alphabet=\"ipa\" ph=\"ˌæn.θɹəˈpɪk\">Anthropic</phoneme>",
+    );
+    try testing.expectEqual(@as(usize, 3), toks.len);
+    try testing.expect(toks[0] == .phoneme_open);
+    try testing.expectEqualStrings("ipa", toks[0].phoneme_open.alphabet);
+    try testing.expectEqualStrings("ˌæn.θɹəˈpɪk", toks[0].phoneme_open.ph);
+    try testing.expectEqualStrings("Anthropic", toks[1].text);
+    try testing.expect(toks[2] == .phoneme_close);
+}
+
+test "v1.10.12 parse phoneme default alphabet=ipa when omitted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try parse(arena.allocator(), "<phoneme ph=\"miˈstɾal\">Mistral</phoneme>");
+    try testing.expectEqualStrings("ipa", toks[0].phoneme_open.alphabet);
+    try testing.expectEqualStrings("miˈstɾal", toks[0].phoneme_open.ph);
+}
+
+test "v1.10.12 parse sub with alias" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try parse(
+        arena.allocator(),
+        "use <sub alias=\"get conditioning latents\">getConditioningLatents</sub> aqui",
+    );
+    try testing.expectEqual(@as(usize, 5), toks.len);
+    try testing.expectEqualStrings("use ", toks[0].text);
+    try testing.expect(toks[1] == .sub_open);
+    try testing.expectEqualStrings("get conditioning latents", toks[1].sub_open.alias);
+    try testing.expectEqualStrings("getConditioningLatents", toks[2].text);
+    try testing.expect(toks[3] == .sub_close);
+    try testing.expectEqualStrings(" aqui", toks[4].text);
+}
+
+test "v1.10.12 transpileToSay sub replaces body with alias" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try parse(
+        arena.allocator(),
+        "antes <sub alias=\"controle\">CTL</sub> depois",
+    );
+    const out = try transpileToSay(arena.allocator(), toks);
+    // Body "CTL" must NOT appear; alias "controle" must.
+    try testing.expect(std.mem.indexOf(u8, out, "CTL") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "controle") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "antes ") != null);
+    try testing.expect(std.mem.indexOf(u8, out, " depois") != null);
+}
+
+test "v1.10.12 transpileToSay phoneme falls back to body text (no IPA on say)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try parse(
+        arena.allocator(),
+        "<phoneme alphabet=\"ipa\" ph=\"ˌæn.θɹəˈpɪk\">Anthropic</phoneme>",
+    );
+    const out = try transpileToSay(arena.allocator(), toks);
+    // Body text rides through; no [[ipa …]] directive (macOS doesn't accept).
+    try testing.expect(std.mem.indexOf(u8, out, "Anthropic") != null);
+}
+
+test "v1.10.12 stripToPlain sub emits alias" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try parse(
+        arena.allocator(),
+        "fala <sub alias=\"emcêpê\">MCP</sub> rápido",
+    );
+    const out = try stripToPlain(arena.allocator(), toks);
+    try testing.expectEqualStrings("fala emcêpê rápido", out);
+}
+
+test "v1.10.12 stripToPlain phoneme keeps body text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try parse(
+        arena.allocator(),
+        "<phoneme ph=\"miˈstɾal\">Mistral</phoneme> lançou",
+    );
+    const out = try stripToPlain(arena.allocator(), toks);
+    try testing.expectEqualStrings("Mistral lançou", out);
 }

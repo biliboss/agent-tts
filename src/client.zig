@@ -58,6 +58,9 @@ const HELP =
     \\  --sentence-pause MS v1.10.8+: override `[[slnc N]]` after .!? (default 400).
     \\  --newline-pause MS  v1.10.8+: override `[[slnc N]]` after `\n` (default 600).
     \\  --speaker-id N      v1.10.8+: Piper multi-speaker index (-1 = voice default).
+    \\  --cadence           v1.10.12+: cadence tricks (list-end pitch drop,
+    \\                                 bullet lift, breathing splice). Breathing
+    \\                                 needs AGENT_TTS_BREATH_WAV on the daemon.
     \\  --profile tech      v1.10.9: research-anchored Faber tech-narration —
     \\                                --tech + length_scale=1.05 + noise_scale=0.35
     \\                                + noise_w=0.45 + sentence_pause_ms=500.
@@ -103,6 +106,8 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     var sentence_pause_ms: u32 = 0;
     var newline_pause_ms: u32 = 0;
     var speaker_id: i32 = -1;
+    // v1.10.12 — cadence tricks toggle.
+    var cadence_flag: bool = false;
     var text: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -194,6 +199,11 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
             }
         } else if (std.mem.eql(u8, a, "--tech")) {
             tech_flag = true;
+        } else if (std.mem.eql(u8, a, "--cadence")) {
+            // v1.10.12 — opt-in cadence tricks. Profile tech sets this
+            // implicitly. Breathing splice is gated by AGENT_TTS_BREATH_WAV
+            // env var on the daemon side.
+            cadence_flag = true;
         } else if (std.mem.eql(u8, a, "--comma-pause")) {
             i += 1;
             if (i >= args.len) {
@@ -253,6 +263,11 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
                 if (noise_scale < 0) noise_scale = 0.35;
                 if (noise_w < 0) noise_w = 0.45;
                 if (sentence_pause_ms == 0) sentence_pause_ms = 500;
+                // v1.10.12 — profile tech defaults cadence on too. The
+                // breathing splice still requires AGENT_TTS_BREATH_WAV on
+                // the daemon side, so this is the safe extension: list-end
+                // drop + bullet lift fire for free.
+                cadence_flag = true;
             } else {
                 std.debug.print("error: --profile unknown (got '{s}'; expected: tech)\n", .{profile});
                 std.process.exit(2);
@@ -306,6 +321,7 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
         .sentence_pause_ms = sentence_pause_ms,
         .newline_pause_ms = newline_pause_ms,
         .speaker_id = speaker_id,
+        .cadence = cadence_flag,
         .text = clean,
     };
 
@@ -685,6 +701,10 @@ pub fn enqueueLineTuned(
 /// three Piper inference knobs, tech-report mode, per-call pause
 /// overrides, AND multi-speaker selector. All sentinels work — pass
 /// `false` / `0` / `-1` to keep the daemon's defaults.
+///
+/// v1.10.12 — thin shim over `enqueueLineWithCadence`. Existing callers
+/// (synth_voice_test, voice_knob_search, tech_profile_search) keep
+/// working with cadence=false by default.
 pub fn enqueueLineFull(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -703,6 +723,49 @@ pub fn enqueueLineFull(
     newline_pause_ms: u32,
     speaker_id: i32,
 ) ![]u8 {
+    return enqueueLineWithCadence(
+        arena,
+        io,
+        home,
+        engine,
+        voice,
+        rate,
+        text,
+        ssml_flag,
+        length_scale,
+        noise_scale,
+        noise_w,
+        tech,
+        comma_pause_ms,
+        sentence_pause_ms,
+        newline_pause_ms,
+        speaker_id,
+        false,
+    );
+}
+
+/// v1.10.12 — enqueue with the cadence flag exposed. Otherwise identical
+/// to `enqueueLineFull`. The MCP `say` and `synth_voice_test` tools route
+/// through here so an agent can opt into cadence per call.
+pub fn enqueueLineWithCadence(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    engine: ipc.Engine,
+    voice: []const u8,
+    rate: u32,
+    text: []const u8,
+    ssml_flag: bool,
+    length_scale: f32,
+    noise_scale: f32,
+    noise_w: f32,
+    tech: bool,
+    comma_pause_ms: u32,
+    sentence_pause_ms: u32,
+    newline_pause_ms: u32,
+    speaker_id: i32,
+    cadence: bool,
+) ![]u8 {
     const clean = try ipc.sanitizeText(arena, text);
     const msg = ipc.Message{
         .engine = engine,
@@ -717,6 +780,7 @@ pub fn enqueueLineFull(
         .sentence_pause_ms = sentence_pause_ms,
         .newline_pause_ms = newline_pause_ms,
         .speaker_id = speaker_id,
+        .cadence = cadence,
         .text = clean,
     };
 

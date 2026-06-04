@@ -124,6 +124,10 @@ pub const Message = struct {
     /// v1.10.8 — Piper multi-speaker selector. `-1` means "use voice
     /// config default". Single-speaker voices (Faber) ignore this.
     speaker_id: i32 = -1,
+    /// v1.10.12 — apply cadence tricks (list-end pitch drop, bullet lift,
+    /// breathing splice) before the SSML walker. Default false; the
+    /// `--profile tech` shortcut sets it true.
+    cadence: bool = false,
     text: []const u8,
 };
 
@@ -172,11 +176,15 @@ pub fn sanitizeText(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
 }
 
 pub fn encodeEnqueue(arena: std.mem.Allocator, msg: Message) ![]u8 {
-    // v1.10.8 wire format: 9 fields. The extra quintuple between the tune
-    // triplet and text carries (tech:comma:sentence:newline:speaker). When
-    // every component is unset (false / 0 / -1), the field collapses to
-    // an empty `""` slot to keep the common case compact — the parser
-    // treats empty AND any field with ≥4 colons as the extra slot.
+    // v1.10.12 wire format: 10 fields. The cadence flag sits between the
+    // extra quintuple and text. We keep the common-case-compact strategy
+    // from v1.10.8: when cadence is false, the slot stays empty `""` so
+    // older parsers walk past it as the text head and the v1.10.8 9-field
+    // parser still works against this binary.
+    //
+    // Actually — for forwards-only compat we ALWAYS emit the cadence slot
+    // (so v1.10.12+ daemons see it), and rely on the daemon's parser to
+    // recognise empty/`0`/`1` between the extra quintuple and text.
     const ssml_str: []const u8 = if (msg.ssml) "1" else "0";
     const tune = try formatTuneTriplet(arena, msg.length_scale, msg.noise_scale, msg.noise_w);
     const extra = try formatExtraQuintuple(
@@ -187,10 +195,11 @@ pub fn encodeEnqueue(arena: std.mem.Allocator, msg: Message) ![]u8 {
         msg.newline_pause_ms,
         msg.speaker_id,
     );
+    const cadence_str: []const u8 = if (msg.cadence) "1" else "0";
     return try std.fmt.allocPrint(
         arena,
-        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\t{s}\t{s}\n",
-        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_str, tune, extra, msg.text },
+        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
+        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_str, tune, extra, cadence_str, msg.text },
     );
 }
 
@@ -420,9 +429,45 @@ pub fn parseRequest(arena: std.mem.Allocator, line: []const u8) ParseError!Reque
 
                         if (looksLikeExtraQuintuple(extra_peek)) {
                             const extra = try parseExtraQuintuple(extra_peek);
-                            const text = it.rest();
-                            if (text.len == 0) return error.Malformed;
-                            const text_dup = arena.dupe(u8, text) catch return error.Malformed;
+                            // v1.10.12 — peek the next field for a cadence
+                            // flag. `0` / `1` exactly = 10-field form (the
+                            // field IS the cadence flag); anything else =
+                            // legacy 9-field (the field IS the text head).
+                            const next_peek = it.next() orelse {
+                                // No field after extra → malformed (every
+                                // form requires at least a text token).
+                                return error.Malformed;
+                            };
+
+                            var cadence_flag: bool = false;
+                            const text_head: []const u8 = if (next_peek.len == 1 and (next_peek[0] == '0' or next_peek[0] == '1')) blk: {
+                                cadence_flag = next_peek[0] == '1';
+                                // text is whatever rests after the cadence slot
+                                break :blk it.rest();
+                            } else next_peek;
+
+                            // When cadence flag consumed `next_peek`, splice
+                            // text from `it.rest()` only (already set above).
+                            // Otherwise `text_head` was the first text segment
+                            // and we may need to splice with `it.rest()`.
+                            const text_dup = blk_t: {
+                                if (cadence_flag or (next_peek.len == 1 and (next_peek[0] == '0' or next_peek[0] == '1'))) {
+                                    if (text_head.len == 0) return error.Malformed;
+                                    break :blk_t arena.dupe(u8, text_head) catch return error.Malformed;
+                                }
+                                const rest_after = it.rest();
+                                if (rest_after.len == 0) {
+                                    if (text_head.len == 0) return error.Malformed;
+                                    break :blk_t arena.dupe(u8, text_head) catch return error.Malformed;
+                                }
+                                const total = arena.alloc(u8, text_head.len + 1 + rest_after.len) catch return error.Malformed;
+                                @memcpy(total[0..text_head.len], text_head);
+                                total[text_head.len] = '\t';
+                                @memcpy(total[text_head.len + 1 ..], rest_after);
+                                break :blk_t total;
+                            };
+                            if (text_dup.len == 0) return error.Malformed;
+
                             return .{ .enqueue = .{
                                 .engine = engine,
                                 .lang = lang,
@@ -437,6 +482,7 @@ pub fn parseRequest(arena: std.mem.Allocator, line: []const u8) ParseError!Reque
                                 .sentence_pause_ms = extra.sentence_ms,
                                 .newline_pause_ms = extra.newline_ms,
                                 .speaker_id = extra.speaker_id,
+                                .cadence = cadence_flag,
                                 .text = text_dup,
                             } };
                         }
@@ -1052,6 +1098,65 @@ test "v1.10.8 backward-compat: v1.10.7 8-field still parses" {
     try std.testing.expectEqual(false, req.enqueue.tech);
     try std.testing.expectEqual(@as(i32, -1), req.enqueue.speaker_id);
     try std.testing.expectEqualStrings("Olá warm Faber.", req.enqueue.text);
+}
+
+// ---- v1.10.12 — cadence flag (10-field wire) ----
+
+test "v1.10.12 parseRequest 10-field ENQUEUE with cadence=1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t0\t-:-:-\t1:-:-:-:-\t1\tA Anthropic, a Mistral, a Groq.",
+    );
+    try std.testing.expectEqual(true, req.enqueue.cadence);
+    try std.testing.expectEqual(true, req.enqueue.tech);
+    try std.testing.expectEqualStrings("A Anthropic, a Mistral, a Groq.", req.enqueue.text);
+}
+
+test "v1.10.12 parseRequest 10-field with cadence=0 defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t0\t\t\t0\tTeste sem cadence.",
+    );
+    try std.testing.expectEqual(false, req.enqueue.cadence);
+    try std.testing.expectEqualStrings("Teste sem cadence.", req.enqueue.text);
+}
+
+test "v1.10.12 backward-compat: v1.10.8 9-field still parses (cadence default false)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t0\t-:-:-\t1:120:500:700:-\tAPI rodou.",
+    );
+    try std.testing.expectEqual(false, req.enqueue.cadence);
+    try std.testing.expectEqual(true, req.enqueue.tech);
+    try std.testing.expectEqualStrings("API rodou.", req.enqueue.text);
+}
+
+test "v1.10.12 encodeEnqueue round-trips cadence flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original: Message = .{
+        .engine = .piper,
+        .lang = .pt,
+        .voice = "faber",
+        .rate = 330,
+        .ssml = false,
+        .tech = true,
+        .cadence = true,
+        .text = "A Anthropic, a Mistral.",
+    };
+    const wire = try encodeEnqueue(a, original);
+    const line = wire[0 .. wire.len - 1];
+    const req = try parseRequest(a, line);
+    try std.testing.expectEqual(true, req.enqueue.cadence);
+    try std.testing.expectEqual(true, req.enqueue.tech);
+    try std.testing.expectEqualStrings("A Anthropic, a Mistral.", req.enqueue.text);
 }
 
 test "v1.10.7 backward-compat: v1.8 7-field still parses with knobs at sentinels" {

@@ -34,7 +34,7 @@ const ipc = @import("ipc.zig");
 const client = @import("client.zig");
 const preproc = @import("preproc.zig");
 
-pub const VERSION = "1.10.9";
+pub const VERSION = "1.10.12";
 pub const PROTOCOL_VERSION = "2024-11-05";
 
 const READ_BUF = 256 * 1024; // long agent monologues hit ~8 KB after escaping
@@ -307,6 +307,11 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
         .{ "type", str("integer") },
         .{ "description", str("v1.10.8+: Piper multi-speaker integer index. -1 = use voice config default. Faber is single-speaker (ignored).") },
     });
+    // v1.10.12 — cadence tricks toggle.
+    const cadence_prop = try obj(a, &.{
+        .{ "type", str("boolean") },
+        .{ "description", str("v1.10.12+: cadence tricks (list-end pitch drop on 3+-item enumerations, bullet-point lift on `-`/`*`/`•` lines, breathing splice every 2-3 sentences). Breathing audio splice requires AGENT_TTS_BREATH_WAV env var on the daemon — otherwise the marker stays as a silent `<break time=\"80ms\"/>`.") },
+    });
 
     const props = try obj(a, &.{
         .{ "text", text_prop },
@@ -322,6 +327,7 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
         .{ "sentence_pause_ms", sentence_pause_prop },
         .{ "newline_pause_ms", newline_pause_prop },
         .{ "speaker_id", speaker_id_prop },
+        .{ "cadence", cadence_prop },
     });
     const required = try arr(a, &.{str("text")});
 
@@ -356,6 +362,8 @@ fn synthVoiceTestSchema(a: std.mem.Allocator) !json.Value {
     const sentence_pause_prop = try obj(a, &.{ .{ "type", str("integer") }, .{ "description", str("v1.10.8+: sentence pause override (ms).") } });
     const newline_pause_prop = try obj(a, &.{ .{ "type", str("integer") }, .{ "description", str("v1.10.8+: newline pause override (ms).") } });
     const speaker_id_prop = try obj(a, &.{ .{ "type", str("integer") }, .{ "description", str("v1.10.8+: Piper speaker index (-1 = default).") } });
+    // v1.10.12 — cadence echoed back for A/B parameter tracking.
+    const cadence_prop = try obj(a, &.{ .{ "type", str("boolean") }, .{ "description", str("v1.10.12+: cadence tricks (list-end drop + bullet lift + breathing splice).") } });
     const props = try obj(a, &.{
         .{ "text", text_prop },
         .{ "length_scale", length_scale_prop },
@@ -366,6 +374,7 @@ fn synthVoiceTestSchema(a: std.mem.Allocator) !json.Value {
         .{ "sentence_pause_ms", sentence_pause_prop },
         .{ "newline_pause_ms", newline_pause_prop },
         .{ "speaker_id", speaker_id_prop },
+        .{ "cadence", cadence_prop },
     });
     const required = try arr(a, &.{str("text")});
     return try obj(a, &.{
@@ -755,8 +764,14 @@ fn callSay(
         if (v.integer < -1 or v.integer > 1000) return try toolErrorResponse(a, id, "speaker_id out of range (-1..1000)");
         speaker_id = @intCast(v.integer);
     }
+    // v1.10.12 — cadence tricks toggle.
+    var cadence_flag: bool = false;
+    if (ao.get("cadence")) |v| {
+        if (v != .bool) return try toolErrorResponse(a, id, "cadence must be a boolean");
+        cadence_flag = v.bool;
+    }
 
-    const id_str = client.enqueueLineFull(
+    const id_str = client.enqueueLineWithCadence(
         a,
         io,
         home,
@@ -773,6 +788,7 @@ fn callSay(
         sentence_pause_ms,
         newline_pause_ms,
         speaker_id,
+        cadence_flag,
     ) catch |e| switch (e) {
         error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running — start with `agent-tts daemon` or `agent-tts daemon install`"),
         error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error"),
@@ -901,8 +917,14 @@ fn callSynthVoiceTest(
         if (v.integer < -1 or v.integer > 1000) return try toolErrorResponse(a, id, "speaker_id out of range (-1..1000)");
         speaker_id = @intCast(v.integer);
     }
+    // v1.10.12 — cadence tricks toggle.
+    var cadence_flag: bool = false;
+    if (ao.get("cadence")) |v| {
+        if (v != .bool) return try toolErrorResponse(a, id, "cadence must be a boolean");
+        cadence_flag = v.bool;
+    }
 
-    const id_str = client.enqueueLineFull(
+    const id_str = client.enqueueLineWithCadence(
         a,
         io,
         home,
@@ -919,6 +941,7 @@ fn callSynthVoiceTest(
         sentence_pause_ms,
         newline_pause_ms,
         speaker_id,
+        cadence_flag,
     ) catch |e| switch (e) {
         error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
         error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error"),
@@ -937,6 +960,7 @@ fn callSynthVoiceTest(
         .{ "sentence_pause_ms", int(@intCast(sentence_pause_ms)) },
         .{ "newline_pause_ms", int(@intCast(newline_pause_ms)) },
         .{ "speaker_id", int(@intCast(speaker_id)) },
+        .{ "cadence", boolean(cadence_flag) },
     });
     const text_block = try formatJsonAsText(a, payload);
     return try toolTextResponse(a, id, text_block);

@@ -103,6 +103,10 @@ pub const PoppedItem = struct {
     newline_pause_ms: u32 = 0,
     /// v1.10.8 — Piper multi-speaker id; -1 = use voice config default.
     speaker_id: i32 = -1,
+    /// v1.10.12 — cadence tricks flag (list-end drop / bullet lift /
+    /// breathing splice). Persisted so daemon restart preserves it on
+    /// pending rows.
+    cadence: bool = false,
     text: []u8,
 };
 
@@ -141,7 +145,8 @@ const SCHEMA =
     \\  comma_pause_ms INTEGER,
     \\  sentence_pause_ms INTEGER,
     \\  newline_pause_ms INTEGER,
-    \\  speaker_id INTEGER
+    \\  speaker_id INTEGER,
+    \\  cadence INTEGER
     \\);
     \\CREATE INDEX IF NOT EXISTS items_pending_idx ON items(state, id) WHERE state IN ('pending','playing');
 ;
@@ -222,6 +227,12 @@ pub const Queue = struct {
             try execSimple(q.db, "ALTER TABLE items ADD COLUMN speaker_id INTEGER;");
         }
 
+        // v1.10.12 migration: cadence column. NULL = legacy row, treated
+        // as cadence=false by the worker.
+        if (!try hasColumn(q.db, "items", "cadence")) {
+            try execSimple(q.db, "ALTER TABLE items ADD COLUMN cadence INTEGER;");
+        }
+
         // Crash recovery: any row left in 'playing' from a prior daemon run
         // belongs to a `say` that was killed by daemon death — re-queue it.
         try execSimple(q.db, "UPDATE items SET state='pending', started_at=NULL WHERE state='playing';");
@@ -239,7 +250,7 @@ pub const Queue = struct {
         try q.mu.lock(io);
         defer q.mu.unlock(io);
 
-        const sql = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?);";
+        const sql = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id,cadence) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?,?);"; // v1.10.12
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DbPrepare;
         defer _ = c.sqlite3_finalize(stmt);
@@ -296,6 +307,12 @@ pub const Queue = struct {
         } else {
             if (c.sqlite3_bind_null(stmt, 14) != c.SQLITE_OK) return error.DbBind;
         }
+        // v1.10.12 — cadence column. Null when default.
+        if (msg.cadence) {
+            if (c.sqlite3_bind_int(stmt, 15, 1) != c.SQLITE_OK) return error.DbBind;
+        } else {
+            if (c.sqlite3_bind_null(stmt, 15) != c.SQLITE_OK) return error.DbBind;
+        }
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
 
         const id: u64 = @intCast(c.sqlite3_last_insert_rowid(q.db));
@@ -319,7 +336,7 @@ pub const Queue = struct {
 
     // Returns next pending row marked 'playing'. Must be called under `mu`.
     fn tryClaimNext(q: *Queue, io: std.Io, gpa: std.mem.Allocator) ?PoppedItem {
-        const sql_sel = "SELECT id, voice, rate, text, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id FROM items WHERE state='pending' ORDER BY id ASC LIMIT 1;";
+        const sql_sel = "SELECT id, voice, rate, text, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id, cadence FROM items WHERE state='pending' ORDER BY id ASC LIMIT 1;"; // v1.10.12
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql_sel, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
@@ -382,6 +399,11 @@ pub const Queue = struct {
             if (c.sqlite3_column_type(stmt, 13) == c.SQLITE_NULL) break :blk -1;
             break :blk @intCast(c.sqlite3_column_int(stmt, 13));
         };
+        // v1.10.12 — cadence column at index 14.
+        const cadence_flag: bool = blk: {
+            if (c.sqlite3_column_type(stmt, 14) == c.SQLITE_NULL) break :blk false;
+            break :blk c.sqlite3_column_int(stmt, 14) != 0;
+        };
 
         const sql_upd = "UPDATE items SET state='playing', started_at=? WHERE id=?;";
         var ustmt: ?*c.sqlite3_stmt = null;
@@ -413,6 +435,7 @@ pub const Queue = struct {
             .sentence_pause_ms = sentence_ms,
             .newline_pause_ms = newline_ms,
             .speaker_id = speaker_id,
+            .cadence = cadence_flag,
             .text = text,
         };
     }
@@ -573,7 +596,7 @@ pub const Queue = struct {
         defer q.mu.unlock(io);
 
         // Look up source row.
-        const sql_sel = "SELECT text, voice, rate, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id FROM items WHERE id=?;";
+        const sql_sel = "SELECT text, voice, rate, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id, cadence FROM items WHERE id=?;"; // v1.10.12
         var sel: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql_sel, -1, &sel, null) != c.SQLITE_OK) return error.DbPrepare;
         defer _ = c.sqlite3_finalize(sel);
@@ -609,9 +632,12 @@ pub const Queue = struct {
         const newline_val: c_int = if (newline_null) 0 else c.sqlite3_column_int(sel, 11);
         const speaker_null = c.sqlite3_column_type(sel, 12) == c.SQLITE_NULL;
         const speaker_val: c_int = if (speaker_null) 0 else c.sqlite3_column_int(sel, 12);
+        // v1.10.12 — cadence at column 13.
+        const cadence_null = c.sqlite3_column_type(sel, 13) == c.SQLITE_NULL;
+        const cadence_val: c_int = if (cadence_null) 0 else c.sqlite3_column_int(sel, 13);
 
         // INSERT the copy.
-        const sql_ins = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?);";
+        const sql_ins = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id,cadence) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?,?);"; // v1.10.12
         var ins: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql_ins, -1, &ins, null) != c.SQLITE_OK) return error.DbPrepare;
         defer _ = c.sqlite3_finalize(ins);
@@ -646,6 +672,10 @@ pub const Queue = struct {
         if (speaker_null) {
             if (c.sqlite3_bind_null(ins, 14) != c.SQLITE_OK) return error.DbBind;
         } else if (c.sqlite3_bind_int(ins, 14, speaker_val) != c.SQLITE_OK) return error.DbBind;
+        // v1.10.12 — cadence column at parameter 15.
+        if (cadence_null) {
+            if (c.sqlite3_bind_null(ins, 15) != c.SQLITE_OK) return error.DbBind;
+        } else if (c.sqlite3_bind_int(ins, 15, cadence_val) != c.SQLITE_OK) return error.DbBind;
         if (c.sqlite3_step(ins) != c.SQLITE_DONE) return error.DbStep;
 
         const new_id: u64 = @intCast(c.sqlite3_last_insert_rowid(q.db));

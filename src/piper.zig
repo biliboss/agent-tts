@@ -415,15 +415,56 @@ pub const MultiPiperEngine = struct {
         var prosody_depth: u32 = 0;
         var saved_rate: f32 = 1.0;
 
+        // v1.10.12 — suppress body text inside <sub> and <phoneme>. The
+        // alias / IPA passthrough already represents the spoken form; the
+        // body text is the displayed form and must NOT also reach the
+        // phonemizer (that would duplicate the brand name in the audio).
+        var sub_depth: u32 = 0;
+        var phoneme_depth: u32 = 0;
+
         // Accumulate text fragments and flush at scope boundaries / breaks.
         var pending: std.ArrayList(u8) = .empty;
         defer pending.deinit(arena);
 
         for (tokens) |tok| {
             switch (tok) {
-                .text => |t| try pending.appendSlice(arena, t),
+                .text => |t| {
+                    // Drop body text inside <sub>…</sub> and <phoneme>…</phoneme>
+                    // — the open handler already emitted the spoken form.
+                    if (sub_depth == 0 and phoneme_depth == 0) {
+                        try pending.appendSlice(arena, t);
+                    }
+                },
                 .emphasis_open, .emphasis_close => {}, // best-effort: no Piper knob
                 .sayas_open, .sayas_close => {},
+                // v1.10.12 — `<phoneme alphabet="ipa" ph="X">body</phoneme>`.
+                // libpiper's espeak-ng frontend accepts `[[X]]` Kirshenbaum-
+                // style IPA brackets in the input text. We splice the bracket
+                // form into the pending stream and suppress the body until
+                // close. Worst case (espeak-ng doesn't recognise the IPA),
+                // the bracketed form is treated as literal characters — not
+                // ideal but no worse than dropping the tag.
+                .phoneme_open => |p| {
+                    if (p.ph.len > 0) {
+                        try pending.append(arena, '[');
+                        try pending.append(arena, '[');
+                        try pending.appendSlice(arena, p.ph);
+                        try pending.append(arena, ']');
+                        try pending.append(arena, ']');
+                    }
+                    phoneme_depth += 1;
+                },
+                .phoneme_close => {
+                    if (phoneme_depth > 0) phoneme_depth -= 1;
+                },
+                // v1.10.12 — `<sub alias="A">body</sub>`: emit alias, drop body.
+                .sub_open => |s| {
+                    try pending.appendSlice(arena, s.alias);
+                    sub_depth += 1;
+                },
+                .sub_close => {
+                    if (sub_depth > 0) sub_depth -= 1;
+                },
                 .@"break" => |b| {
                     // Flush pending text before inserting silence.
                     if (pending.items.len > 0) {
