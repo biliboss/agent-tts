@@ -380,6 +380,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_ssml_tests = b.addRunArtifact(ssml_tests);
 
+    // v1.10.10 — postfx module tests. Pure-Zig unit tests (chain
+    // strings, profile fromStr round-trip, no-op pass-through). The
+    // ffmpeg subprocess path isn't reachable from here without an
+    // event loop + ffmpeg on PATH; live validation covers it.
+    const postfx_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/postfx.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_postfx_tests = b.addRunArtifact(postfx_tests);
+
     // Benchmark executable for the preprocessor (used to populate
     // _qa/v0.5-baseline.md). Build in ReleaseFast for realistic numbers.
     const preproc_mod = b.createModule(.{
@@ -442,4 +456,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ipc_tests.step);
     test_step.dependOn(&run_stream_tests.step);
     test_step.dependOn(&run_ssml_tests.step);
+    test_step.dependOn(&run_postfx_tests.step);
 }

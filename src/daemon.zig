@@ -21,6 +21,7 @@ const Queue = @import("queue.zig").Queue;
 const queue_mod = @import("queue.zig");
 const audio = @import("audio.zig");
 const preproc = @import("preproc.zig");
+const postfx_mod = @import("postfx.zig");
 const build_options = @import("build_options");
 
 // Piper is only @imported when the build enables it — otherwise piper.h
@@ -110,6 +111,9 @@ const Resources = struct {
     // isn't on disk — synth falls back to Pt and the warning logs once.
     piper: ?*piper_mod.MultiPiperEngine,
     io: std.Io,
+    /// v1.10.10 — forwarded $HOME so postfx can probe
+    /// `~/.cache/agent-tts/rnnoise/cb.rnnn` for the RNNoise model.
+    home: []const u8,
     /// v1.10.2 — id of the row the worker is currently playing. Set when
     /// runOne begins, cleared on completion. IPC PAUSE/RESUME read this to
     /// ack the affected id. 0 means "nothing playing right now". Atomic so
@@ -219,6 +223,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
         .audio_player = &audio_player,
         .piper = piper_engine_ptr,
         .io = io,
+        .home = home,
     };
 
     const worker = try std.Thread.spawn(.{}, workerLoop, .{&resources});
@@ -323,14 +328,9 @@ fn runCloned(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod
     // so we share Faber's pipeline. Document in motor.md.
     const sample_rate: u32 = 22050;
     const t_play0 = std.Io.Clock.now(.awake, io);
-    if (res.audio_player.ready) {
-        res.audio_player.streamS16le(samples, sample_rate) catch |e| {
-            std.debug.print("[worker] zaudio play failed: {s} — falling back to afplay\n", .{@errorName(e)});
-            try playViaAfplay(io, sa, samples, sample_rate);
-        };
-    } else {
-        try playViaAfplay(io, sa, samples, sample_rate);
-    }
+    // v1.10.10 — cloned path uses streamS16le (non-append) per the
+    // pre-existing behaviour. postfx applied inline when item.postfx != .off.
+    try playWithPostfx(res, io, sa, item.id, samples, sample_rate, item.postfx, false);
     const t_play1 = std.Io.Clock.now(.awake, io);
 
     const synth_ms = @as(f64, @floatFromInt(t_synth1.nanoseconds - t_synth0.nanoseconds)) / 1_000_000.0;
@@ -630,14 +630,7 @@ fn runPiperSsml(
 
     const sample_rate = engine.sampleRate();
     const t_play0 = std.Io.Clock.now(.awake, io);
-    if (res.audio_player.ready) {
-        res.audio_player.streamS16leAppend(samples, sample_rate) catch |e| {
-            std.debug.print("[worker] zaudio play failed: {s} — falling back to afplay\n", .{@errorName(e)});
-            try playViaAfplay(io, sa, samples, sample_rate);
-        };
-    } else {
-        try playViaAfplay(io, sa, samples, sample_rate);
-    }
+    try playWithPostfx(res, io, sa, item.id, samples, sample_rate, item.postfx, true);
     const t_play1 = std.Io.Clock.now(.awake, io);
 
     const parse_us = @as(f64, @floatFromInt(t_parse1.nanoseconds - t_parse0.nanoseconds)) / 1_000.0;
@@ -702,14 +695,7 @@ fn runPiperSingle(
 
     const sample_rate = engine.sampleRate();
     const t_play0 = std.Io.Clock.now(.awake, io);
-    if (res.audio_player.ready) {
-        res.audio_player.streamS16leAppend(samples, sample_rate) catch |e| {
-            std.debug.print("[worker] zaudio play failed: {s} — falling back to afplay\n", .{@errorName(e)});
-            try playViaAfplay(io, sa, samples, sample_rate);
-        };
-    } else {
-        try playViaAfplay(io, sa, samples, sample_rate);
-    }
+    try playWithPostfx(res, io, sa, item.id, samples, sample_rate, item.postfx, true);
     const t_play1 = std.Io.Clock.now(.awake, io);
 
     const synth_ms = @as(f64, @floatFromInt(t_synth1.nanoseconds - t_synth0.nanoseconds)) / 1_000_000.0;
@@ -918,13 +904,30 @@ fn runPiperStreaming(
             first_play_started = true;
         }
 
+        // v1.10.10 — route this chunk's PCM through postfx before
+        // playback when item.postfx != .off. The processed buffer is
+        // allocated inside the slot's per-chunk arena so it dies with
+        // the slot at the end of this loop iteration.
+        var play_samples: []const i16 = slot.samples;
+        if (item.postfx != .off) {
+            const slot_alloc: ?std.mem.Allocator = if (slot.arena) |*a| @constCast(a).allocator() else null;
+            if (slot_alloc) |arena_alloc| {
+                const apply_res = postfx_mod.apply(arena_alloc, io, slot.samples, slot.sample_rate, item.postfx, res.home) catch postfx_mod.ApplyResult{ .samples = slot.samples, .was_processed = false };
+                if (apply_res.was_processed) {
+                    play_samples = apply_res.samples;
+                    const warn = if (apply_res.postfx_ms > 100.0) " (>100ms — eating into TTFA)" else "";
+                    std.debug.print("[worker] id={d} chunk={d} postfx={s} postfx_ms={d:.1}{s}\n", .{ item.id, played_chunks, item.postfx.str(), apply_res.postfx_ms, warn });
+                }
+            }
+        }
+
         const play_res = if (res.audio_player.ready) blk: {
-            break :blk res.audio_player.streamS16leAppend(slot.samples, slot.sample_rate);
+            break :blk res.audio_player.streamS16leAppend(play_samples, slot.sample_rate);
         } else blk: {
             // afplay fallback needs a short-lived arena for the tmp WAV path.
             var fb_arena = std.heap.ArenaAllocator.init(gpa);
             defer fb_arena.deinit();
-            break :blk playViaAfplay(io, fb_arena.allocator(), slot.samples, slot.sample_rate);
+            break :blk playViaAfplay(io, fb_arena.allocator(), play_samples, slot.sample_rate);
         };
 
         played_chunks += 1;
@@ -984,6 +987,51 @@ fn buildChunks(sa: std.mem.Allocator, item: queue_mod.PoppedItem) !?[]preproc.Ch
     const chunks = try preproc.splitByLang(sa, item.text, .pt);
     if (chunks.len == 0) return null;
     return chunks;
+}
+
+/// v1.10.10 — play samples through the postfx chain (when item.postfx
+/// != .off) and onto the device. Encapsulates the
+/// `postfx.apply → audio_player.streamS16leAppend → afplay-fallback`
+/// path so the three runPiper* call sites and the cloned path share
+/// the same routing. Logs a single `postfx=<profile> postfx_ms=<ms>`
+/// line per call when the chain actually ran.
+fn playWithPostfx(
+    res: *Resources,
+    io: std.Io,
+    sa: std.mem.Allocator,
+    item_id: u64,
+    samples: []const i16,
+    sample_rate: u32,
+    profile: ipc.Postfx,
+    append: bool,
+) !void {
+    var processed = samples;
+    if (profile != .off) {
+        const apply_res = postfx_mod.apply(sa, io, samples, sample_rate, profile, res.home) catch |e| blk: {
+            std.debug.print("[worker] id={d} postfx={s} apply error: {s} — falling back to dry PCM\n", .{ item_id, profile.str(), @errorName(e) });
+            break :blk postfx_mod.ApplyResult{ .samples = samples, .was_processed = false };
+        };
+        if (apply_res.was_processed) {
+            processed = apply_res.samples;
+            const warn = if (apply_res.postfx_ms > 100.0) " (>100ms — eating into TTFA)" else "";
+            std.debug.print("[worker] id={d} postfx={s} postfx_ms={d:.1}{s}\n", .{ item_id, profile.str(), apply_res.postfx_ms, warn });
+        } else {
+            std.debug.print("[worker] id={d} postfx={s} passthrough (ffmpeg/model unavailable)\n", .{ item_id, profile.str() });
+        }
+    }
+
+    if (res.audio_player.ready) {
+        const play_res = if (append)
+            res.audio_player.streamS16leAppend(processed, sample_rate)
+        else
+            res.audio_player.streamS16le(processed, sample_rate);
+        play_res catch |e| {
+            std.debug.print("[worker] zaudio play failed: {s} — falling back to afplay\n", .{@errorName(e)});
+            try playViaAfplay(io, sa, processed, sample_rate);
+        };
+    } else {
+        try playViaAfplay(io, sa, processed, sample_rate);
+    }
 }
 
 // Last-resort playback when zaudio.Engine isn't ready (headless CI, audio

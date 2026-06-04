@@ -324,7 +324,54 @@ v1.10.11 parses `AGENT_TTS_AUDIO_DITHER` (`triangle` default | `none`) and logs 
 ```
 
 Flipping to `none` produces identical audio today. The env knob is wired so a future patch can replace the engine with a custom `data_callback` over `ma_data_converter` (where we control `dither_mode` directly) without breaking the operator contract. Logged as an honest no-op in the v1.10.11 changelog.
+## Audio post-processing (v1.10.10)
 
+v1.10.10 lands the second half of the research note's "Acoustic post-processing" recipe: an opt-in ffmpeg subprocess pipeline that runs between piper's PCM and the zaudio device pump. Four profile chains are selectable via `--postfx P` on the CLI, `postfx` on the MCP `say` / `synth_voice_test` schemas, or per-variant inside `tech_profile_search`.
+
+### Profiles
+
+| Profile | Filter chain | Use case |
+|---|---|---|
+| `off` (default) | none — PCM goes straight to zaudio | dry path; zero overhead |
+| `clean` | `highpass=f=80,acompressor=threshold=-18dB:ratio=2:attack=20:release=200:makeup=1dB` | light: clears rumble + tames dynamics; ~30ms warm |
+| `tech` | `arnndn=m=cb.rnnn,highpass=f=80,equalizer=f=280:width_type=o:width=2:g=2.5,equalizer=f=3500:width_type=o:width=1.5:g=-1.5,equalizer=f=10000:width_type=o:width=2:g=1.8,deesser=i=0.08:m=0.5,acompressor=threshold=-18dB:ratio=2:attack=20:release=200:makeup=2dB` | research chain: RNNoise + warmth (280 Hz) + presence cut (3.5 kHz) + air (10 kHz) + de-esser + 2:1 comp; ~60-90ms warm |
+| `broadcast` | `highpass=f=80,equalizer=f=280:width_type=o:width=2:g=2.0,equalizer=f=3000:width_type=o:width=1.5:g=-1.0,deesser=i=0.08:m=0.4,acompressor=threshold=-14dB:ratio=3:attack=15:release=180:makeup=2.5dB` | tighter dynamic range for podcasts/announcements; ~50-70ms warm |
+
+`tech` is the heavy hitter. When RNNoise isn't available the `arnndn=` prefix drops out and the EQ+deesser+comp subset still runs — still a quality lift over dry, just without the neural denoise.
+
+### Install prerequisites
+
+```bash
+# ffmpeg — required for any profile other than off
+brew install ffmpeg
+
+# RNNoise model — optional but recommended for postfx=tech
+mkdir -p ~/.cache/agent-tts/rnnoise
+curl -sL https://github.com/GregorR/rnnoise-models/raw/master/conjoined-burgers-2018-08-28/cb.rnnn \
+  -o ~/.cache/agent-tts/rnnoise/cb.rnnn
+```
+
+`agent-tts` probes for ffmpeg at `$AGENT_TTS_FFMPEG_PATH`, then `/opt/homebrew/bin/ffmpeg`, then `/usr/local/bin/ffmpeg`, then bare `ffmpeg` on PATH. When none exist or the subprocess fails, `postfx=tech` silently falls back to dry PCM and the daemon logs `passthrough (ffmpeg/model unavailable)`. The pipeline is a quality lift, not a hard dependency.
+
+RNNoise model path probes `$AGENT_TTS_POSTFX_RNNN_MODEL` first, then `~/.cache/agent-tts/rnnoise/cb.rnnn`.
+
+### Latency budget
+
+Daemon logs `[worker] id=N chunk=K postfx=tech postfx_ms=X` per chunk. When `postfx_ms` exceeds 100ms the line is suffixed `(>100ms — eating into TTFA)` so A/B sessions surface latency regressions. Typical cost on M-series silicon:
+
+| Cost | First chunk | Subsequent |
+|---|---|---|
+| `clean` | ~50ms | ~25ms |
+| `tech` | ~150-200ms | ~60-90ms |
+| `broadcast` | ~80ms | ~50ms |
+
+The streaming pipeline absorbs this because synth-per-chunk is itself ~80-150ms. A single short utterance pays the full first-chunk overhead on first-audio.
+
+### Wiring
+
+The post-fx call sits inside `daemon.zig::playWithPostfx`, between `piper.synth*` (or `cloned`'s sidecar) and `audio_player.streamS16leAppend`. Streaming, single-chunk, and SSML paths all funnel through the same helper. The cloned (XTTS-v2) path also routes through postfx so user-cloned voices benefit from the same chain.
+
+`postfx=off` (the default) returns the PCM slice unchanged with `was_processed=false` — zero allocation, zero subprocess, zero overhead.
 ## Cloned voices (v1.4)
 
 v1.4 adds a **third engine**: `cloned`. Selected automatically when `--voice <slug>` resolves to a directory under `~/.cache/agent-tts/voices/<slug>/` produced by `agent-tts voice clone`.

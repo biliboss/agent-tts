@@ -103,6 +103,9 @@ pub const PoppedItem = struct {
     newline_pause_ms: u32 = 0,
     /// v1.10.8 — Piper multi-speaker id; -1 = use voice config default.
     speaker_id: i32 = -1,
+    /// v1.10.10 — audio post-fx profile. Daemon routes PCM through
+    /// `postfx.apply` before zaudio playback when non-`.off`.
+    postfx: ipc.Postfx = .off,
     text: []u8,
 };
 
@@ -141,7 +144,8 @@ const SCHEMA =
     \\  comma_pause_ms INTEGER,
     \\  sentence_pause_ms INTEGER,
     \\  newline_pause_ms INTEGER,
-    \\  speaker_id INTEGER
+    \\  speaker_id INTEGER,
+    \\  postfx TEXT
     \\);
     \\CREATE INDEX IF NOT EXISTS items_pending_idx ON items(state, id) WHERE state IN ('pending','playing');
 ;
@@ -222,6 +226,13 @@ pub const Queue = struct {
             try execSimple(q.db, "ALTER TABLE items ADD COLUMN speaker_id INTEGER;");
         }
 
+        // v1.10.10 migration: postfx TEXT column. NULL = .off (default
+        // pass-through). Worker maps NULL/unknown back to .off so a
+        // bogus value can never wedge the device pump.
+        if (!try hasColumn(q.db, "items", "postfx")) {
+            try execSimple(q.db, "ALTER TABLE items ADD COLUMN postfx TEXT;");
+        }
+
         // Crash recovery: any row left in 'playing' from a prior daemon run
         // belongs to a `say` that was killed by daemon death — re-queue it.
         try execSimple(q.db, "UPDATE items SET state='pending', started_at=NULL WHERE state='playing';");
@@ -239,7 +250,7 @@ pub const Queue = struct {
         try q.mu.lock(io);
         defer q.mu.unlock(io);
 
-        const sql = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?);";
+        const sql = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id,postfx) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?,?);";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.DbPrepare;
         defer _ = c.sqlite3_finalize(stmt);
@@ -296,6 +307,14 @@ pub const Queue = struct {
         } else {
             if (c.sqlite3_bind_null(stmt, 14) != c.SQLITE_OK) return error.DbBind;
         }
+        // v1.10.10 — postfx column. NULL when the caller left it at
+        // the default (.off) so default rows stay neutral.
+        if (msg.postfx != .off) {
+            const pfx_str = msg.postfx.str();
+            if (c.sqlite3_bind_text(stmt, 15, pfx_str.ptr, @intCast(pfx_str.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        } else {
+            if (c.sqlite3_bind_null(stmt, 15) != c.SQLITE_OK) return error.DbBind;
+        }
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
 
         const id: u64 = @intCast(c.sqlite3_last_insert_rowid(q.db));
@@ -319,7 +338,7 @@ pub const Queue = struct {
 
     // Returns next pending row marked 'playing'. Must be called under `mu`.
     fn tryClaimNext(q: *Queue, io: std.Io, gpa: std.mem.Allocator) ?PoppedItem {
-        const sql_sel = "SELECT id, voice, rate, text, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id FROM items WHERE state='pending' ORDER BY id ASC LIMIT 1;";
+        const sql_sel = "SELECT id, voice, rate, text, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id, postfx FROM items WHERE state='pending' ORDER BY id ASC LIMIT 1;";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql_sel, -1, &stmt, null) != c.SQLITE_OK) return null;
         defer _ = c.sqlite3_finalize(stmt);
@@ -382,6 +401,17 @@ pub const Queue = struct {
             if (c.sqlite3_column_type(stmt, 13) == c.SQLITE_NULL) break :blk -1;
             break :blk @intCast(c.sqlite3_column_int(stmt, 13));
         };
+        // v1.10.10 — postfx column. NULL → .off (default). Unknown
+        // strings fall back to .off too so a corrupted/legacy value
+        // can never wedge the device pump.
+        const postfx_val: ipc.Postfx = blk: {
+            if (c.sqlite3_column_type(stmt, 14) == c.SQLITE_NULL) break :blk .off;
+            const ptr = c.sqlite3_column_text(stmt, 14);
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 14));
+            if (ptr == null or len == 0) break :blk .off;
+            const txt = ptr[0..len];
+            break :blk ipc.Postfx.fromStr(txt) orelse .off;
+        };
 
         const sql_upd = "UPDATE items SET state='playing', started_at=? WHERE id=?;";
         var ustmt: ?*c.sqlite3_stmt = null;
@@ -413,6 +443,7 @@ pub const Queue = struct {
             .sentence_pause_ms = sentence_ms,
             .newline_pause_ms = newline_ms,
             .speaker_id = speaker_id,
+            .postfx = postfx_val,
             .text = text,
         };
     }
@@ -573,7 +604,7 @@ pub const Queue = struct {
         defer q.mu.unlock(io);
 
         // Look up source row.
-        const sql_sel = "SELECT text, voice, rate, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id FROM items WHERE id=?;";
+        const sql_sel = "SELECT text, voice, rate, engine, ssml, length_scale, noise_scale, noise_w, tech, comma_pause_ms, sentence_pause_ms, newline_pause_ms, speaker_id, postfx FROM items WHERE id=?;";
         var sel: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql_sel, -1, &sel, null) != c.SQLITE_OK) return error.DbPrepare;
         defer _ = c.sqlite3_finalize(sel);
@@ -609,9 +640,18 @@ pub const Queue = struct {
         const newline_val: c_int = if (newline_null) 0 else c.sqlite3_column_int(sel, 11);
         const speaker_null = c.sqlite3_column_type(sel, 12) == c.SQLITE_NULL;
         const speaker_val: c_int = if (speaker_null) 0 else c.sqlite3_column_int(sel, 12);
+        // v1.10.10 — postfx column. NULL preserved as NULL through replay.
+        const postfx_null = c.sqlite3_column_type(sel, 13) == c.SQLITE_NULL;
+        const postfx_text: ?[]const u8 = blk: {
+            if (postfx_null) break :blk null;
+            const ptr = c.sqlite3_column_text(sel, 13);
+            const len: usize = @intCast(c.sqlite3_column_bytes(sel, 13));
+            if (ptr == null or len == 0) break :blk null;
+            break :blk ptr[0..len];
+        };
 
         // INSERT the copy.
-        const sql_ins = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?);";
+        const sql_ins = "INSERT INTO items(text,voice,rate,state,enqueued_at,engine,ssml,length_scale,noise_scale,noise_w,tech,comma_pause_ms,sentence_pause_ms,newline_pause_ms,speaker_id,postfx) VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?,?,?,?,?);";
         var ins: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(q.db, sql_ins, -1, &ins, null) != c.SQLITE_OK) return error.DbPrepare;
         defer _ = c.sqlite3_finalize(ins);
@@ -646,6 +686,11 @@ pub const Queue = struct {
         if (speaker_null) {
             if (c.sqlite3_bind_null(ins, 14) != c.SQLITE_OK) return error.DbBind;
         } else if (c.sqlite3_bind_int(ins, 14, speaker_val) != c.SQLITE_OK) return error.DbBind;
+        if (postfx_text) |pfx| {
+            if (c.sqlite3_bind_text(ins, 15, pfx.ptr, @intCast(pfx.len), sqlite_static) != c.SQLITE_OK) return error.DbBind;
+        } else {
+            if (c.sqlite3_bind_null(ins, 15) != c.SQLITE_OK) return error.DbBind;
+        }
         if (c.sqlite3_step(ins) != c.SQLITE_DONE) return error.DbStep;
 
         const new_id: u64 = @intCast(c.sqlite3_last_insert_rowid(q.db));
