@@ -116,6 +116,55 @@ agent-tts --rate 220 "Mais rápido."             # WPM (say only — piper ignor
 
 Persistent config in `~/.config/agent-tts/config.json` planned for v1.1.
 
+## SSML extensions + cadence tricks (v1.10.12+)
+
+Three additions land in v1.10.12 to push *prosody* without retraining the voice. All three are optional and gated.
+
+### `<phoneme alphabet="ipa" ph="…">` — IPA passthrough
+
+Pipe the brand name through piper's espeak-ng phonemizer using `[[ipa]]` Kirshenbaum brackets. `say` strips the tag silently (macOS has no IPA directive) and falls back to the body text.
+
+```bash
+agent-tts --ssml '<phoneme alphabet="ipa" ph="ˌæn.θɹəˈpɪk">Anthropic</phoneme> lançou Claude.'
+agent-tts --ssml '<phoneme alphabet="ipa" ph="miˈstɾal">Mistral</phoneme> rodou.'
+agent-tts --ssml '<phoneme alphabet="ipa" ph="ɡɹɒk">Groq</phoneme> via API.'
+agent-tts --ssml '<phoneme alphabet="ipa" ph="oʊˈlɑːmə">Ollama</phoneme> local.'
+```
+
+Quality is espeak-ng-bound — verify the brand sounds right before declaring it fixed. Body text inside `<phoneme>` is suppressed on piper (the IPA already represents the spoken form) but kept on `say` (it's the only fallback).
+
+### `<sub alias="…">` — display vs spoken split
+
+Rewrite a displayed identifier to the human-spoken form at preproc time. The alias text replaces the body verbatim on every engine.
+
+```bash
+agent-tts --ssml 'Use <sub alias="get conditioning latents">getConditioningLatents</sub> aqui.'
+agent-tts --ssml 'Roda no <sub alias="emcêpê">MCP</sub> server.'
+```
+
+### Cadence tricks (`--cadence`)
+
+Three independent rules toggled by `CadenceOptions`. `--profile tech` enables all the safe ones; breathing stays opt-in via the env var.
+
+1. **List-end intonation drop.** Sentences with ≥2 commas wrap the last 3 word tokens in `<prosody pitch="-10%" rate="slow">…</prosody>`. Mimics the natural fall at the end of a list.
+2. **Bullet-point lift.** Lines starting with `-`, `*`, or `•` wrap the leading label (up to `:` or `—`) in `<prosody pitch="+5%">…</prosody>`. Crisper structure for outline-style speech.
+3. **Breathing simulation.** State machine emits `<break time="80ms"/>[[breath]]` every 2-3 sentences. The daemon swaps `[[breath]]` for a pre-loaded WAV when `AGENT_TTS_BREATH_WAV` is set; otherwise the silent break still slows the cadence audibly.
+
+Sox one-liner for the breath WAV:
+
+```bash
+sox -n -r 22050 -c 1 ~/.cache/agent-tts/breath.wav synth 0.08 pinknoise vol 0.006
+export AGENT_TTS_BREATH_WAV=$HOME/.cache/agent-tts/breath.wav
+```
+
+Then:
+
+```bash
+agent-tts --profile tech --cadence "A Anthropic, a Mistral, a Groq, quatro LLM labs. Cada uma com sua API."
+```
+
+The daemon log will show the SSML walker took over (`piper-ssml id=… tokens=N`) and the resulting prosody/break tags rode into the synth. Cadence persists across daemon restarts via the new `cadence` SQLite column.
+
 ## Tuning Piper per call (v1.10.7+)
 
 Three Piper inference knobs are exposed per call. They override any daemon-wide `AGENT_TTS_PIPER_*` env var and the voice config defaults:

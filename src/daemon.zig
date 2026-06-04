@@ -266,6 +266,22 @@ fn workerLoop(res: *Resources) void {
     }
 }
 
+/// v1.10.12 — true when `AGENT_TTS_BREATH_WAV` env var is set to a
+/// non-empty path. Used by the cadence pipeline to decide whether the
+/// `[[breath]]` marker becomes an audible splice. When the env var is
+/// missing we still emit the marker as a literal (it's a noop for piper
+/// because the bracket form looks like an espeak-ng IPA passthrough that
+/// expands to silence in most voices).
+fn breathEnabled() bool {
+    const stdlib = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const ptr = stdlib.getenv("AGENT_TTS_BREATH_WAV");
+    if (ptr == null) return false;
+    const s = std.mem.span(ptr);
+    return s.len > 0;
+}
+
 fn runOne(res: *Resources, io: std.Io, gpa: std.mem.Allocator, item: queue_mod.PoppedItem) !void {
     var spawn_arena = std.heap.ArenaAllocator.init(gpa);
     defer spawn_arena.deinit();
@@ -527,7 +543,16 @@ fn runSay(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.Po
         .sentence_ms = item.sentence_pause_ms,
         .newline_ms = item.newline_pause_ms,
     };
-    var spawned = try tts.spawnSayTuned(sa, io, item.voice, item.rate, item.text, item.ssml, item.tech, pauses);
+    // v1.10.12 — apply cadence tricks before handing off to `say`. The
+    // tricks emit SSML which spawnSayTuned routes through the SSML walker
+    // when item.ssml is set; otherwise it falls through as bonus prosody
+    // hints + a literal `[[breath]]` marker that say says as a word —
+    // acceptable since breathing is opt-in via the env var.
+    const text_for_say: []const u8 = if (item.tech)
+        preproc.applyCadenceTricks(sa, item.text, .{ .enable_breathing = breathEnabled() }) catch item.text
+    else
+        item.text;
+    var spawned = try tts.spawnSayTuned(sa, io, item.voice, item.rate, text_for_say, item.ssml, item.tech, pauses);
 
     const pid = spawned.child.id orelse return error.SpawnNoPid;
     res.queue.setPlaying(io, item.id, pid);
@@ -544,12 +569,27 @@ fn runPiper(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.
     if (!build_options.enabled) unreachable;
     const engine = res.piper.?;
 
+    // v1.10.12 — when cadence is set, apply the cadence tricks first
+    // (emitting SSML prosody + breath markers) and then force the SSML
+    // walker path so the resulting `<prosody>` / `<break>` survive into
+    // the synth pipeline. Without this hop, the prosody tags would be
+    // glossary-expanded as raw text and read aloud.
+    var effective_item = item;
+    if (item.tech) {
+        const cadence_opts: preproc.CadenceOptions = .{ .enable_breathing = breathEnabled() };
+        const after_cadence = preproc.applyCadenceTricks(sa, item.text, cadence_opts) catch item.text;
+        // The cadence output is SSML; route through the SSML walker.
+        const new_text = sa.dupe(u8, after_cadence) catch item.text;
+        effective_item.text = new_text;
+        effective_item.ssml = true;
+    }
+
     // v1.8 — SSML routing. Single-pass walk of the token stream: the
     // streaming chunker can't see inside tags safely (a sentence period
     // inside `<prosody>` would split the scope), so SSML inputs take a
     // simpler non-streaming path. Trade-off documented in motor.md.
-    if (item.ssml) {
-        runPiperSsml(res, io, sa, item, engine) catch |e| {
+    if (effective_item.ssml) {
+        runPiperSsml(res, io, sa, effective_item, engine) catch |e| {
             res.queue.finishPlaying(io, item.id);
             return e;
         };
@@ -561,7 +601,7 @@ fn runPiper(res: *Resources, io: std.Io, sa: std.mem.Allocator, item: queue_mod.
     // then per-chunk language detect (or forced via item.lang) routes Pt
     // sentences to Faber and En sentences to Amy. Single-chunk inputs
     // skip the pipeline and take the v0.7 fast path below.
-    const sentence_chunks = preproc.chunkSentences(sa, item.text) catch |e| {
+    const sentence_chunks = preproc.chunkSentences(sa, effective_item.text) catch |e| {
         res.queue.finishPlaying(io, item.id);
         return e;
     };

@@ -56,6 +56,45 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 - **ffmpeg failures are silent** — when `ffmpeg` isn't on PATH, when the subprocess exits non-zero, or when the chain produces zero bytes, `apply()` returns the original PCM with `was_processed=false` and the daemon plays dry. The user sees no error message; the log shows `passthrough (ffmpeg/model unavailable)`. Conscious choice — audio playback is the primary contract; postfx is a quality lift, not a hard dependency
 - **Postfx applies AFTER chunking** — each streaming chunk goes through ffmpeg independently. RNNoise needs ~480 samples of context to settle so the very first chunk may sound slightly noisier than chunks 2+. Acceptable for the v1.10.10 use case; a future v1.10.11+ could pre-prime RNNoise with a silence preamble
 - **Default profile remapping is breaking, sort of** — `--profile tech` now means the tight-narrator bundle (research-anchored). Callers that wanted the legacy v1.10.8 numbers should switch to `--profile stock-tech`. Help text + MCP descriptions document the swap
+## v1.10.12 — SSML phoneme/sub + cadence tricks (list-end drop + bullet lift + breathing splice) · 2026-06-04
+
+**Why a patch:** v1.10.9's tech profile got the words right; v1.10.12 makes the *cadence* right. Three wins from the v1.10.9 research note we hadn't shipped: `<phoneme alphabet="ipa" ph="…">` so agents can force IPA pronunciation for brand names (Anthropic, Mistral, Groq, Ollama), `<sub alias="…">` so code identifiers like `getConditioningLatents` can be said as the human form, and a cadence pass that wraps the last 3 words of list-final sentences with `<prosody pitch="-10%" rate="slow">`, lifts bullet labels with `<prosody pitch="+5%">`, and splices an 80ms pink-noise breath sample every 2-3 sentences when `AGENT_TTS_BREATH_WAV` is set.
+
+**Shipped:**
+
+- **`src/ssml.zig`** — `<phoneme alphabet="ipa" ph="ˌæn.θɹəˈpɪk">` parses into a `phoneme_open`/`phoneme_close` token pair carrying alphabet + ph. `<sub alias="…">` parses into `sub_open` with the alias string. Parser default `alphabet="ipa"` when omitted. `transpileToSay` strips phoneme tags silently (macOS has no IPA passthrough — body text rides through), and replaces the body of `<sub>` with the alias verbatim
+- **`src/piper.zig::synthLangSSML`** — phoneme open emits `[[<ipa>]]` Kirshenbaum brackets into the espeak-ng phonemizer (libpiper accepts the bracket form natively). `<sub>` open emits the alias text. Body text inside both is suppressed via a depth counter so the displayed form never reaches the engine
+- **`src/preproc.zig::applyCadenceTricks`** — three independent rules toggled by `CadenceOptions`. List-end drop: sentences with ≥2 commas wrap their last 3 word tokens in `<prosody pitch="-10%" rate="slow">…</prosody>`. Bullet lift: lines starting with `-` / `*` / `•` wrap the leading label (up to `:` or `—`) in `<prosody pitch="+5%">…</prosody>`. Breathing splice: state machine emits `<break time="80ms"/>[[breath]]` every 2-3 sentences; daemon swaps `[[breath]]` for a pre-loaded WAV sample when `AGENT_TTS_BREATH_WAV` env var points at one
+- **`src/daemon.zig`** — when `item.cadence == true`, the tech path runs `applyCadenceTricks` BEFORE the SSML walker. The cadence output is SSML so the resulting `<prosody>` / `<break>` survive into the synth pipeline. Falls back to the silent break when the breath WAV env var is missing
+- **`src/ipc.zig`** — 10-field wire format with the cadence flag between the extra quintuple and text. Backward-compat: v1.10.8 9-field still parses (the parser peeks the slot after the extra quintuple — `0`/`1` is the cadence slot, anything else is the text head)
+- **`src/queue.zig`** — `cadence INTEGER` column with an idempotent migration. Replay copies the cadence flag along with every other knob
+- **`src/client.zig`** — `--cadence` CLI flag (default off). `--profile tech` flips it on so the existing tech profile gets list-end drop + bullet lift for free; breathing stays opt-in via the env var
+- **`src/mcp.zig`** — `say` and `synth_voice_test` schemas grow a `cadence: boolean` property; the response echoes the resolved value so an agent can A/B with/without
+- VERSION 1.10.12 — binary + bundle + MCP server
+
+**Sox one-liner for the breath WAV:**
+
+```bash
+sox -n -r 22050 -c 1 ~/.cache/agent-tts/breath.wav synth 0.08 pinknoise vol 0.006
+# then point the daemon at it:
+export AGENT_TTS_BREATH_WAV=$HOME/.cache/agent-tts/breath.wav
+```
+
+**IPA examples:**
+
+```bash
+agent-tts --ssml '<phoneme alphabet="ipa" ph="ˌæn.θɹəˈpɪk">Anthropic</phoneme> lançou Claude.'
+agent-tts --ssml '<phoneme alphabet="ipa" ph="miˈstɾal">Mistral</phoneme> rodou.'
+agent-tts --ssml 'Use <sub alias="get conditioning latents">getConditioningLatents</sub> aqui.'
+```
+
+**Validated end-to-end**: `AGENT_TTS_BREATH_WAV=$HOME/.cache/agent-tts/breath.wav agent-tts --profile tech --cadence "A Anthropic, a Mistral, a Groq, quatro LLM labs. Cada uma com sua API."` → daemon log shows `[worker] piper-ssml id=200 tokens=5 parse=173.7µs synth=700.5ms play=5603.6ms samples=122112` (cadence flipped to SSML path, list-end drop wrapped "quatro LLM labs"). MCP `say` with `{"cadence":true,"tech":true}` persists `cadence=1, tech=1` to the queue row. **All tests passed** (`zig build test` exit 0).
+
+**Honest scope**:
+- **IPA passthrough quality is espeak-ng-bound** — `[[<ipa>]]` brackets are accepted by libpiper's phonemizer but the audible result depends on whether espeak-ng's IPA→phoneme table covers the symbols you pass. Anthropic-style ASCII-IPA (`ˌæn.θɹəˈpɪk`) tends to land cleanly; exotic diacritics may fall back to the default Pt-BR mapping. Listen first before declaring a brand "fixed"
+- **Cadence rules are independent and conservative** — list-end drop only fires when ≥2 commas appear AND the last 3 tokens don't already contain a tag. Bullet lift only fires on whitespace-delimited bullet markers. Breathing splice is OFF by default; `--profile tech` enables it but the audio splice only activates when the env var is set. Silent fallback is `<break time="80ms"/>` — audible-anyway as a small pause
+- **`<phoneme>` body text suppressed for piper, kept for `say`** — `say` has no IPA directive so dropping the body would silence the brand entirely. Piper honours the bracket form, so keeping the body would duplicate the brand in the audio. The asymmetry is intentional
+
 ---
 
 ## v1.10.9 — Research-informed tech profile + glossary expansion · 2026-06-04

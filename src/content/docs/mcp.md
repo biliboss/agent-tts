@@ -44,7 +44,11 @@ You should get back a single JSON line listing the 13 tools.
 
 | Tool | Args | Returns |
 |------|------|---------|
+<<<<<<< HEAD
 | `say` | `{ text, engine?, voice?, rate?, ssml?, length_scale?, noise_scale?, noise_w?, tech?, comma_pause_ms?, sentence_pause_ms?, newline_pause_ms?, speaker_id?, postfx? }` | `{ id }` |
+=======
+| `say` | `{ text, engine?, voice?, rate?, ssml?, length_scale?, noise_scale?, noise_w?, tech?, comma_pause_ms?, sentence_pause_ms?, newline_pause_ms?, speaker_id?, cadence? }` | `{ id }` |
+>>>>>>> agent-tts/v1.10.12
 | `queue` | `{}` | `{ items: [...] }` |
 | `skip` | `{ id? }` (ignored in v1.5) | `{ skipped_id }` |
 | `clear` | `{}` | `{ cleared_count }` |
@@ -54,7 +58,11 @@ You should get back a single JSON line listing the 13 tools.
 | `resume` (v1.10.2+) | `{}` | `{ resumed_id }` (0 = not paused) |
 | `replay` (v1.10.2+) | `{ id }` | `{ new_id }` (0 = item not found) |
 | `history` (v1.10.2+) | `{ limit? }` (1..100, default 20) | `{ items: [{id,state,engine,voice,rate,finished_at,text}, ...] }` |
+<<<<<<< HEAD
 | `synth_voice_test` (v1.10.7+) | `{ text, length_scale?, noise_scale?, noise_w?, tech?, *_pause_ms?, speaker_id?, postfx? }` | `{ id, …resolved knobs…, postfx }` |
+=======
+| `synth_voice_test` (v1.10.7+) | `{ text, length_scale?, noise_scale?, noise_w?, tech?, *_pause_ms?, speaker_id?, cadence? }` | `{ id, …resolved knobs… }` |
+>>>>>>> agent-tts/v1.10.12
 | `voice_knob_search` (v1.10.8+) | `{ text, variants: [{...knobs, comment?}], max_variants? }` | `{ items: [{id, comment, knobs}], truncated }` |
 | `tech_profile_search` (v1.10.10+) | `{ text }` | `{ items: [{id, name, postfx, comment, knobs}], count: 8 }` — fixed 4×2 matrix (tight-narrator / stock-tech / broadcast / expressive) × (postfx=off / postfx=tech) so the caller A/Bs both knob AND post-fx in one round-trip |
 

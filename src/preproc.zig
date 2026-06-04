@@ -158,6 +158,28 @@ pub const TechOptions = struct {
     keep_acronyms_short_limit: usize = 3,
 };
 
+/// v1.10.12 — toggles for the cadence pass. Each rule fires independently
+/// so an agent can enable list-end drop without picking up the breathing
+/// splice (which requires a pre-staged breath WAV). All gated, all default
+/// to the safer values:
+///
+/// * `enable_list_end_drop` — wraps the last 3 words of sentences after
+///   3+-item enumerations in `<prosody pitch="-10%" rate="slow">…</prosody>`.
+///   On by default because Piper's espeak-ng frontend understands prosody
+///   tags cleanly and the audible effect is small.
+/// * `enable_bullet_lift` — wraps the leading label of any bullet line
+///   (`- Label: detail`) in `<prosody pitch="+5%">…</prosody>`. On by
+///   default; same rationale.
+/// * `enable_breathing` — emits a literal `[[breath]]` marker every 2-3
+///   sentences. The marker is no-op unless `AGENT_TTS_BREATH_WAV` is set
+///   AND the daemon's breath splice path activates. Off by default to
+///   avoid a silent failure when the user hasn't generated the WAV.
+pub const CadenceOptions = struct {
+    enable_list_end_drop: bool = true,
+    enable_bullet_lift: bool = true,
+    enable_breathing: bool = false,
+};
+
 // v1.2 streaming Chunk type unified with v1.1's lang-aware shape — see
 // `pub const Chunk` near the top of this file. chunkSentences emits
 // `lang = .unknown` and the daemon's runPiper assigns the detected
@@ -248,6 +270,280 @@ pub fn processTech(
     tech: TechOptions,
 ) ![]u8 {
     return processTechWithPauses(arena, raw, tech, .{});
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// v1.10.12 — cadence tricks
+// ──────────────────────────────────────────────────────────────────────
+//
+// Three rules run in one pass over the input text (already glossary-
+// expanded by the tech pipeline). Output is SSML — the daemon's SSML
+// walker then transpiles the prosody tags to length_scale changes on
+// Piper or `[[…]]` directives on `say`.
+//
+// 1. **List-end intonation drop.** Sentences containing an enumeration
+//    of ≥3 comma-separated items get their last 3 whitespace tokens
+//    wrapped in `<prosody pitch="-10%" rate="slow">…</prosody>`. Detect
+//    enumerations via `count_commas(sentence) >= 2 AND " e " in sentence`
+//    OR a list-like shape. Sentences without enumerations are untouched.
+//
+// 2. **Bullet-point lift.** Any line that starts with `-`, `•`, or `*`
+//    followed by whitespace gets its leading label (up to `:` or `—` or
+//    end-of-line) wrapped in `<prosody pitch="+5%">…</prosody>`. Lines
+//    without those markers are untouched.
+//
+// 3. **Breathing simulation.** A state machine emits `[[breath]]` (a
+//    literal marker the daemon's audio path translates to an 80ms
+//    pink-noise splice IF `AGENT_TTS_BREATH_WAV` is set) every 2-3
+//    sentences. Also emits a `<break time="80ms"/>` SSML break so the
+//    silent fallback still slows the cadence audibly.
+//
+// All three rules are independent and the function is idempotent on
+// already-tagged input (it only inserts `<prosody>` if the substring it
+// would wrap doesn't already start with one). The pass runs O(N) in the
+// input length with a single ArrayList(u8) allocation.
+
+/// Apply the v1.10.12 cadence tricks to `raw`. Returns a freshly-allocated
+/// buffer (in `arena`). Each rule is gated by the matching `opts` field.
+pub fn applyCadenceTricks(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+    opts: CadenceOptions,
+) ![]u8 {
+    if (raw.len == 0) return arena.alloc(u8, 0);
+
+    // Stage 1 — bullet-point lift (line-oriented). Process the input
+    // line-by-line; non-bullet lines pass through, bullet lines get the
+    // leading label wrapped.
+    var after_bullets: []u8 = undefined;
+    if (opts.enable_bullet_lift) {
+        after_bullets = try applyBulletLift(arena, raw);
+    } else {
+        after_bullets = try arena.dupe(u8, raw);
+    }
+
+    // Stage 2 — list-end drop (sentence-oriented). Split on `.`, `!`,
+    // `?`, and `\n`; for each sentence that looks enumerative, wrap the
+    // last 3 word tokens.
+    var after_list_drop: []u8 = undefined;
+    if (opts.enable_list_end_drop) {
+        after_list_drop = try applyListEndDrop(arena, after_bullets);
+    } else {
+        after_list_drop = after_bullets;
+    }
+
+    // Stage 3 — breathing splice. State machine inserts a literal
+    // `[[breath]]` marker + `<break time="80ms"/>` every 2-3 sentences.
+    // The marker is a no-op for `say` (it just looks like a word) and the
+    // daemon's audio path translates it to a pink-noise WAV splice when
+    // the env var is set. The `<break>` is the audible-anyway fallback.
+    if (opts.enable_breathing) {
+        return try applyBreathingSplice(arena, after_list_drop);
+    }
+    return after_list_drop;
+}
+
+fn applyBulletLift(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, raw.len + raw.len / 4);
+
+    var i: usize = 0;
+    while (i < raw.len) {
+        // Find the end of the current line.
+        const line_start = i;
+        while (i < raw.len and raw[i] != '\n') i += 1;
+        const line_end = i;
+        const line = raw[line_start..line_end];
+
+        // Detect bullet marker: optional leading whitespace, then `-`,
+        // `*`, or `•`, then whitespace.
+        var lead: usize = 0;
+        while (lead < line.len and (line[lead] == ' ' or line[lead] == '\t')) lead += 1;
+        const marker_is_bullet = blk: {
+            if (lead >= line.len) break :blk false;
+            const c = line[lead];
+            if (c == '-' or c == '*') {
+                // require trailing whitespace so "----" doesn't match
+                if (lead + 1 < line.len and (line[lead + 1] == ' ' or line[lead + 1] == '\t')) break :blk true;
+                break :blk false;
+            }
+            // `•` is a 3-byte UTF-8 sequence: E2 80 A2
+            if (lead + 2 < line.len and line[lead] == 0xE2 and line[lead + 1] == 0x80 and line[lead + 2] == 0xA2) {
+                if (lead + 3 < line.len and (line[lead + 3] == ' ' or line[lead + 3] == '\t')) break :blk true;
+            }
+            break :blk false;
+        };
+
+        if (!marker_is_bullet) {
+            try out.appendSlice(arena, line);
+            if (i < raw.len) try out.append(arena, '\n');
+            if (i < raw.len) i += 1;
+            continue;
+        }
+
+        // Emit leading whitespace + bullet marker + whitespace verbatim.
+        const marker_len: usize = if (line[lead] == 0xE2) 3 else 1;
+        const after_marker = lead + marker_len;
+        var ws_end = after_marker;
+        while (ws_end < line.len and (line[ws_end] == ' ' or line[ws_end] == '\t')) ws_end += 1;
+        try out.appendSlice(arena, line[0..ws_end]);
+
+        // Find the label end: first `:`, `—` (E2 80 94), or end of line.
+        var label_end = ws_end;
+        while (label_end < line.len) {
+            const c = line[label_end];
+            if (c == ':') break;
+            if (label_end + 2 < line.len and c == 0xE2 and line[label_end + 1] == 0x80 and line[label_end + 2] == 0x94) break;
+            label_end += 1;
+        }
+        const label = line[ws_end..label_end];
+
+        // Skip empty labels (the line was just a bullet marker).
+        if (label.len == 0) {
+            try out.appendSlice(arena, line[ws_end..]);
+            if (i < raw.len) try out.append(arena, '\n');
+            if (i < raw.len) i += 1;
+            continue;
+        }
+
+        // Wrap the label.
+        try out.appendSlice(arena, "<prosody pitch=\"+5%\">");
+        try out.appendSlice(arena, label);
+        try out.appendSlice(arena, "</prosody>");
+        try out.appendSlice(arena, line[label_end..]);
+        if (i < raw.len) try out.append(arena, '\n');
+        if (i < raw.len) i += 1;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Detect sentences with ≥3 comma-separated items + wrap last 3 word
+/// tokens with `<prosody pitch="-10%" rate="slow">…</prosody>`. We split
+/// on `.`, `!`, `?`, `\n` boundaries (mirroring `chunkSentences`'s rules
+/// but simpler — no abbreviation guard needed because the comma count
+/// triggers, not the dot itself).
+fn applyListEndDrop(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, raw.len + raw.len / 4);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c == '.' or c == '!' or c == '?' or c == '\n') {
+            // Sentence body excluding the terminator.
+            const body = raw[start..i];
+            try emitSentenceWithListDrop(arena, &out, body);
+            try out.append(arena, c);
+            start = i + 1;
+        }
+    }
+    if (start < raw.len) {
+        try emitSentenceWithListDrop(arena, &out, raw[start..]);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn emitSentenceWithListDrop(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+) !void {
+    // Heuristic: if the sentence has ≥2 commas AND the last 3 words sit
+    // after a comma, wrap them. Skip when the body is too short (< 3 word
+    // tokens) or already contains a closing `</prosody>` (idempotent).
+    var comma_count: usize = 0;
+    for (body) |b| {
+        if (b == ',') comma_count += 1;
+    }
+
+    if (comma_count < 2) {
+        try out.appendSlice(arena, body);
+        return;
+    }
+    if (std.mem.indexOf(u8, body, "</prosody>") != null) {
+        try out.appendSlice(arena, body);
+        return;
+    }
+
+    // Find the start of the last 3 whitespace-delimited tokens. Walk
+    // backwards counting transitions from non-space to space.
+    var word_start: usize = body.len;
+    var words_seen: usize = 0;
+    var k: usize = body.len;
+    while (k > 0) {
+        k -= 1;
+        const ch = body[k];
+        const is_ws = ch == ' ' or ch == '\t';
+        if (!is_ws) {
+            // We're inside a word — walk until we hit ws or start.
+            var w_start = k;
+            while (w_start > 0 and body[w_start - 1] != ' ' and body[w_start - 1] != '\t') w_start -= 1;
+            word_start = w_start;
+            words_seen += 1;
+            if (words_seen == 3) break;
+            k = w_start; // will be decremented at top of loop
+            if (k == 0) break;
+        }
+    }
+
+    if (words_seen < 3) {
+        try out.appendSlice(arena, body);
+        return;
+    }
+
+    // Skip the wrap when the 3-word slice contains `<` or `>` (already
+    // marked up — don't double-wrap).
+    const last3 = body[word_start..];
+    for (last3) |ch| if (ch == '<' or ch == '>') {
+        try out.appendSlice(arena, body);
+        return;
+    };
+
+    try out.appendSlice(arena, body[0..word_start]);
+    try out.appendSlice(arena, "<prosody pitch=\"-10%\" rate=\"slow\">");
+    try out.appendSlice(arena, last3);
+    try out.appendSlice(arena, "</prosody>");
+}
+
+/// Insert a `[[breath]]` marker + `<break time="80ms"/>` every 2-3
+/// sentences. The state machine uses a tiny PRNG-free counter (modulo 2)
+/// so testing is deterministic. Skip the splice when the sentence is
+/// trivially short (≤ 6 chars) — those are interjections, not breathable
+/// units.
+fn applyBreathingSplice(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, raw.len + raw.len / 8);
+
+    var sentence_count: usize = 0;
+    var since_breath: usize = 0;
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c == '.' or c == '!' or c == '?' or c == '\n') {
+            // Compute sentence body length BEFORE flipping `start` —
+            // otherwise the subtraction underflows on usize.
+            const body_len: usize = i - start + 1;
+            // Emit sentence body + terminator first.
+            try out.appendSlice(arena, raw[start .. i + 1]);
+            start = i + 1;
+
+            sentence_count += 1;
+            since_breath += 1;
+            if (body_len < 6) continue;
+            // Insert breath every 2 sentences (alternates 2,3,2,3 with
+            // the modulo on sentence_count).
+            const interval: usize = if ((sentence_count % 2) == 0) 2 else 3;
+            if (since_breath < interval) continue;
+
+            try out.appendSlice(arena, " <break time=\"80ms\"/>[[breath]] ");
+            since_breath = 0;
+        }
+    }
+    if (start < raw.len) try out.appendSlice(arena, raw[start..]);
+    return out.toOwnedSlice(arena);
 }
 
 /// v1.10.8 — tech preproc with explicit pause overrides. v1.10.9 — pipeline
@@ -2148,6 +2444,91 @@ test "incremental: flush on empty buffer returns empty" {
     defer chunker.deinit(arena);
 
     const got = try chunker.flush(arena);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+// ─── v1.10.12 cadence tricks ────────────────────────────────────────
+
+test "cadence: list-end drop wraps last 3 words when sentence has 3+-item enum" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try applyCadenceTricks(
+        arena,
+        "Anthropic, Mistral, Groq e Ollama quatro LLM labs",
+        .{ .enable_list_end_drop = true, .enable_bullet_lift = false, .enable_breathing = false },
+    );
+    // Expect last 3 tokens ("quatro LLM labs") wrapped.
+    try testing.expect(std.mem.indexOf(u8, got, "<prosody pitch=\"-10%\" rate=\"slow\">") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "quatro LLM labs</prosody>") != null);
+}
+
+test "cadence: list-end drop skips sentences without enumerations" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try applyCadenceTricks(
+        arena,
+        "Olá mundo simples sem vírgulas aqui",
+        .{ .enable_list_end_drop = true, .enable_bullet_lift = false, .enable_breathing = false },
+    );
+    try testing.expectEqualStrings("Olá mundo simples sem vírgulas aqui", got);
+}
+
+test "cadence: bullet lift wraps label before colon" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try applyCadenceTricks(
+        arena,
+        "- Velocidade: 250 ms warm synth",
+        .{ .enable_list_end_drop = false, .enable_bullet_lift = true, .enable_breathing = false },
+    );
+    try testing.expect(std.mem.indexOf(u8, got, "- <prosody pitch=\"+5%\">Velocidade</prosody>: 250 ms warm synth") != null);
+}
+
+test "cadence: bullet lift skips non-bullet lines" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try applyCadenceTricks(
+        arena,
+        "linha normal sem bullet",
+        .{ .enable_list_end_drop = false, .enable_bullet_lift = true, .enable_breathing = false },
+    );
+    try testing.expectEqualStrings("linha normal sem bullet", got);
+}
+
+test "cadence: breathing emits [[breath]] markers between sentences" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try applyCadenceTricks(
+        arena,
+        "Primeira sentença comprida aqui. Segunda também boa. Terceira que segue. Quarta vem aí.",
+        .{ .enable_list_end_drop = false, .enable_bullet_lift = false, .enable_breathing = true },
+    );
+    try testing.expect(std.mem.indexOf(u8, got, "[[breath]]") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "<break time=\"80ms\"/>") != null);
+}
+
+test "cadence: breathing disabled by default does not insert markers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try applyCadenceTricks(
+        arena,
+        "Primeira. Segunda. Terceira. Quarta. Quinta.",
+        .{ .enable_list_end_drop = false, .enable_bullet_lift = false, .enable_breathing = false },
+    );
+    try testing.expect(std.mem.indexOf(u8, got, "[[breath]]") == null);
+}
+
+test "cadence: empty input returns empty" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = try applyCadenceTricks(arena, "", .{});
     try testing.expectEqual(@as(usize, 0), got.len);
 }
 
