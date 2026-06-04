@@ -42,6 +42,7 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v1.10.7** | Per-call Piper knobs (`--length-scale` / `--noise-scale` / `--noise-w`) + MCP | 8-field ENQUEUE with tune triplet; 3 new SQLite REAL columns; 11 MCP tools (added `synth_voice_test`) | 2026-06-04 |
 | **v1.10.8** | Tech-report mode + max knob exposure (`--tech` / `--*-pause` / `--speaker-id` / `--profile tech`) + `voice_knob_search` MCP tool | 9-field ENQUEUE with extra quintuple; 5 new SQLite columns; 12 MCP tools; ~50-entry acronym/unit glossary | 2026-06-04 |
 | **v1.10.9** | Research-informed tech profile (`--profile tech` = length 1.05 / noise 0.35 / noise_w 0.45) + glossary +30 entries + CamelCase splitter + version/hash/URL/path/hex normalizer + `tech_profile_search` MCP tool | 13 MCP tools; ~80-entry glossary; 307/307 tests; daemon log `length_scale=1.050 noise_scale=0.350 noise_w=0.450 tech=true` | 2026-06-04 |
+| **v1.10.11** | ONNX session + miniaudio quality knobs — single-threaded ORT via env (`OMP_NUM_THREADS=1` + `ORT_NUM_THREADS=1` + `OMP_THREAD_LIMIT=1` because libpiper@v1.4.2 exposes no `OrtSessionOptions` hook), miniaudio `pitch_resampling.linear.lpf_order=8` (was 0), engine master `setGainDb(-3.0)` for -3 dBFS headroom; 3 new env knobs (`AGENT_TTS_AUDIO_DITHER` / `_LPF_ORDER` / `_HEADROOM_DB`); dither is no-op today (engine doesn't expose `dither_mode`, documented) | tests green; daemon log `[audio] v1.10.11 quality knobs: lpf_order=8 headroom_db=-3.0 dither=triangle` + `[daemon] v1.10.11 onnx env: ...` | 2026-06-04 |
 
 ## KPI delivered
 

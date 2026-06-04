@@ -59,10 +59,55 @@ pub const AudioPlayer = struct {
 
     /// Best-effort init. Returns a player with `.ready = false` on any
     /// failure so the caller can degrade gracefully.
+    ///
+    /// v1.10.11 — engine config now honours three daemon-wide env knobs
+    /// surfaced by the research note at `_qa/v1.10.9-research-prompt-output.md`
+    /// ("Inference-layer knobs you're missing"):
+    ///
+    /// * `AGENT_TTS_AUDIO_LPF_ORDER` (default 8) — linear resampler
+    ///   `lpf_order` on the engine's `pitch_resampling` config. Default in
+    ///   miniaudio is 0 (no LPF; aliasing on the resample edge). 8 is the
+    ///   per-resampler max and removes sibilant aliasing on the 22050 → 48000
+    ///   upsample without measurable CPU cost on M-class silicon. We don't
+    ///   touch `pitch` itself, so the documented biquad-instability gotcha
+    ///   from miniaudio.c:77421 ("disable LPF for pitch shifting") does not
+    ///   apply.
+    /// * `AGENT_TTS_AUDIO_HEADROOM_DB` (default 3) — dB cut applied to the
+    ///   engine master via `setGainDb(-headroom)`. Faber's stressed vowels
+    ///   can push toward 0 dBFS at the end of long phrases; -3 dB gives the
+    ///   miniaudio output-converter clipping margin and keeps the perceived
+    ///   loudness identical-or-quieter (no auto-makeup-gain pass).
+    /// * `AGENT_TTS_AUDIO_DITHER` (default `triangle`) — declares intent.
+    ///   The miniaudio Engine config does NOT expose `dither_mode` for the
+    ///   internal f32 → device-format converter, so we accept the env value
+    ///   and log it but cannot wire it through without a custom data_callback
+    ///   replacing the resource-manager mixing graph. v1.10.11 documents the
+    ///   gap; flipping to `none` is a no-op today. The default value matches
+    ///   what miniaudio would use if we ever bypass the engine: triangle PDF
+    ///   dither on the s16 output to spread quantization noise into white
+    ///   instead of correlated tones on quiet PCM tails.
     pub fn init(allocator: std.mem.Allocator) AudioPlayer {
         zaudio.init(allocator);
 
-        const engine = zaudio.Engine.create(null) catch |e| {
+        // Resolve env knobs once at boot. Daemon-wide; no per-utterance
+        // override (audio engine config is immutable after create).
+        const lpf_order: u32 = blk: {
+            const v = envU32("AGENT_TTS_AUDIO_LPF_ORDER") orelse break :blk 8;
+            // miniaudio caps lpf_order at 8 (MA_MAX_RESAMPLER_LPF_ORDER).
+            if (v > 8) break :blk 8;
+            break :blk v;
+        };
+        const headroom_db: f32 = envFloatLocal("AGENT_TTS_AUDIO_HEADROOM_DB") orelse 3.0;
+        const dither_str = envStrLocal("AGENT_TTS_AUDIO_DITHER") orelse "triangle";
+
+        var engine_cfg = zaudio.Engine.Config.init();
+        // Linear resampler LPF order — affects every Sound that mixes
+        // through the engine because miniaudio's per-sound resampler is
+        // configured from `pitchResamplingConfig` (see miniaudio.c:76587).
+        engine_cfg.pitch_resampling.linear.lpf_order = lpf_order;
+        engine_cfg.resource_manager_resampling.linear.lpf_order = lpf_order;
+
+        const engine = zaudio.Engine.create(engine_cfg) catch |e| {
             std.debug.print("[audio] zaudio engine init failed: {s}\n", .{@errorName(e)});
             zaudio.deinit();
             return .{
@@ -71,10 +116,42 @@ pub const AudioPlayer = struct {
             };
         };
 
+        // Apply headroom. setGainDb(-N) reduces engine output by N dB
+        // before the device-format converter sees the f32 mix.
+        engine.setGainDb(-headroom_db) catch |e| {
+            std.debug.print("[audio] setGainDb(-{d:.1}) failed: {s} (ignored)\n", .{ headroom_db, @errorName(e) });
+        };
+
+        std.debug.print(
+            "[audio] v1.10.11 quality knobs: lpf_order={d} headroom_db=-{d:.1} dither={s} (engine cfg)\n",
+            .{ lpf_order, headroom_db, dither_str },
+        );
+
         return .{
             .engine = engine,
             .ready = true,
         };
+    }
+
+    fn envStrLocal(name: [*:0]const u8) ?[]const u8 {
+        const stdlib = @cImport({
+            @cInclude("stdlib.h");
+        });
+        const ptr = stdlib.getenv(name);
+        if (ptr == null) return null;
+        const s = std.mem.span(ptr);
+        if (s.len == 0) return null;
+        return s;
+    }
+
+    fn envFloatLocal(name: [*:0]const u8) ?f32 {
+        const s = envStrLocal(name) orelse return null;
+        return std.fmt.parseFloat(f32, s) catch null;
+    }
+
+    fn envU32(name: [*:0]const u8) ?u32 {
+        const s = envStrLocal(name) orelse return null;
+        return std.fmt.parseInt(u32, s, 10) catch null;
     }
 
     pub fn deinit(self: *AudioPlayer) void {

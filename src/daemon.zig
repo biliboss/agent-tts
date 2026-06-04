@@ -164,6 +164,34 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, home: []const u8) !void {
     }
     defer audio_player.deinit();
 
+    // v1.10.11 — apply ONNX runtime + miniaudio env knobs BEFORE the
+    // libpiper engine boots. ONNX Runtime reads its thread-pool env vars
+    // (`OMP_NUM_THREADS`, `ORT_NUM_THREADS`, `OMP_THREAD_LIMIT`) once at
+    // session creation; setting them post-boot is too late.
+    //
+    // libpiper's public C ABI (`vendor/piper1-gpl/libpiper/include/piper.h`)
+    // does NOT expose `OrtSessionOptions` — there's no `piper_create_options`
+    // or builder hook in v1.4.2 — so the env-var fallback is the realistic
+    // ship for v1.10.11. The Faber-medium VITS export is 15M params and
+    // single-graph; intra-op parallelism beyond 1 thread costs more in
+    // synchronization than it saves in matmul. Apple Silicon's P-cores want
+    // one hot thread per inference, not four contended ones.
+    //
+    // We `setenv` only when the env isn't already provided so a CI / power
+    // user override still wins. `overwrite=0` is the POSIX flag for that.
+    {
+        const cenv = @cImport({
+            @cInclude("stdlib.h");
+        });
+        _ = cenv.setenv("OMP_NUM_THREADS", "1", 0);
+        _ = cenv.setenv("ORT_NUM_THREADS", "1", 0);
+        _ = cenv.setenv("OMP_THREAD_LIMIT", "1", 0);
+        std.debug.print(
+            "[daemon] v1.10.11 onnx env: OMP_NUM_THREADS=1 ORT_NUM_THREADS=1 OMP_THREAD_LIMIT=1 (libpiper exposes no OrtSessionOptions builder)\n",
+            .{},
+        );
+    }
+
     // libpiper engine. Loads on every boot when the binary is built with
     // -Dwith-piper=true. Pt (Faber) mandatory; En (Amy) best-effort. Cold
     // cost ~700 ms when both load. Opt-out via AGENT_TTS_PIPER=0 (kept for

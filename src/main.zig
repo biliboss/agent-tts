@@ -46,7 +46,7 @@ const mcp = @import("mcp.zig");
 const stream_mod = @import("stream.zig");
 const build_options = @import("build_options");
 
-pub const VERSION = "1.10.9";
+pub const VERSION = "1.10.11";
 
 const HELP =
     \\agent-tts v{s} — multilingual TTS via system voice or libpiper
@@ -129,6 +129,14 @@ const HELP =
     \\Claude Code MCP wire-up (single line in ~/.claude.json):
     \\  "mcpServers": {{ "agent-tts": {{ "command": "agent-tts", "args": ["mcp"] }} }}
     \\See ./scripts/install-mcp.sh for an idempotent installer.
+    \\
+    \\Quality knobs (v1.10.11+, daemon-wide env vars — restart daemon to apply):
+    \\  AGENT_TTS_AUDIO_DITHER       triangle (default) | none — output dither
+    \\  AGENT_TTS_AUDIO_LPF_ORDER    0..8 — linear resampler LPF order (default 8)
+    \\  AGENT_TTS_AUDIO_HEADROOM_DB  dB cut on engine master gain (default 3 → -3 dBFS)
+    \\ONNX runtime (v1.10.11+, applied via env before Piper boot — single-threaded
+    \\optimal on Apple Silicon for the 15M-param Faber VITS):
+    \\  OMP_NUM_THREADS=1 ORT_NUM_THREADS=1 OMP_THREAD_LIMIT=1 (set by the daemon)
     \\
 ;
 

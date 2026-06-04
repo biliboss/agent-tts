@@ -271,6 +271,60 @@ v1.10.9 also rewrites the tech preproc pipeline. The new order, exposed as `prep
 
 Glossary lookup is still longest-first (HTTPS before HTTP, Mbps before bps) so partial matches never steal prefixes.
 
+## ONNX runtime + miniaudio quality (v1.10.11+)
+
+v1.10.11 closes the inference-layer half of the same research note that anchored v1.10.9's tech-profile knobs ([`_qa/v1.10.9-research-prompt-output.md`](https://github.com/biliboss/agent-tts/blob/main/_qa/v1.10.9-research-prompt-output.md), "Inference-layer knobs you're missing"). Two wins shipped + one honest gap documented.
+
+### ONNX Runtime threading — single-threaded by default
+
+ONNX Runtime ships with multi-threaded intra-op and inter-op pools sized to the host CPU. On Apple Silicon's P-cores running the Faber-medium VITS (15M params, single graph), every additional thread costs more in barrier sync than it saves in matmul throughput. The research note's recommendation: `intra_op_num_threads=1`, `inter_op_num_threads=1`, `graph_optimization_level=ORT_ENABLE_BASIC` (bit-exact for future cache keying), disable CPU memory arena.
+
+**How we apply it**: `libpiper@v1.4.2` exposes no `OrtSessionOptions` hook in `piper.h` — the public C ABI is `piper_create(model, config, espeak)` with no builder. So v1.10.11 sets the equivalent environment variables before `bootMultiPiper` calls `piper_create`:
+
+```
+OMP_NUM_THREADS=1
+ORT_NUM_THREADS=1
+OMP_THREAD_LIMIT=1
+```
+
+`setenv(..., overwrite=0)` means a power user can still override per-launch (`OMP_NUM_THREADS=4 launchctl kickstart ...`) without editing the binary. Daemon boot log surfaces it:
+
+```
+[daemon] v1.10.11 onnx env: OMP_NUM_THREADS=1 ORT_NUM_THREADS=1 OMP_THREAD_LIMIT=1 (libpiper exposes no OrtSessionOptions builder)
+```
+
+**Honest gap**: `graph_optimization_level` and the memory-arena flag have no env-var equivalents — they require the C++ `Ort::SessionOptions` builder. We'd need to patch `libpiper.cpp` to take a `piper_create_with_options(...)` constructor, then rebuild the vendored libpiper. Deferred until/if upstream piper1-gpl exposes the hook.
+
+### miniaudio resampler LPF — 0 → 8
+
+`zaudio.Engine.Config.pitch_resampling.linear.lpf_order` is the linear-resampler low-pass filter order applied per-Sound when miniaudio resamples between source and device rates. The default in miniaudio is **0** (no LPF — fast but adds aliasing on the resample edge). Faber output is mono 22050 Hz; the typical macOS device runs at 48000 Hz, so every Sound goes through a 22050 → 48000 upsample. LPF order 8 (the documented `MA_MAX_RESAMPLER_LPF_ORDER`) removes the alias content around the Nyquist edge without measurable CPU cost on M-class silicon.
+
+v1.10.11 sets `lpf_order=8` on both `pitch_resampling` (per-Sound) and `resource_manager_resampling` (resource manager, used when sounds load from files — not our path, but kept in sync for consistency). The per-sound path is what catches our `AudioBuffer`-backed sounds (see `miniaudio.c:76587` where `config.resampling = pEngine->pitchResamplingConfig`).
+
+**Gotcha not triggered**: `miniaudio.c:77421` forces `lpfOrder=0` when `pitch != 1.0` because the biquad filter becomes unstable under pitch-shifting. agent-tts doesn't pitch-shift (we run at native rate after the engine upsample), so the LPF stays engaged.
+
+Override per-launch via `AGENT_TTS_AUDIO_LPF_ORDER` (0..8, default 8).
+
+### Gain staging — -3 dBFS headroom
+
+Faber's stressed vowels at end-of-phrase can push peak amplitudes toward 0 dBFS. miniaudio's f32 → device-format converter doesn't apply soft-knee compression; values past ±1.0 hard-clip on the s16 device output. v1.10.11 drops the engine master via `engine.setGainDb(-3.0)` so every sound is attenuated 3 dB before the converter sees the f32 mix.
+
+Side effect: perceived loudness drops ~3 dB. We don't apply auto-makeup-gain because that defeats the purpose (we'd just push the loud frames back to clipping). The right long-term fix is per-utterance peak normalisation — deferred to a v1.11 postfx track.
+
+Override per-launch via `AGENT_TTS_AUDIO_HEADROOM_DB` (default 3.0, expressed as positive dB cut).
+
+### Dither — env knob, no-op today
+
+The research note recommends `ma_dither_mode_triangle` on the s16 device output to spread quantization noise into white instead of correlated tones on quiet PCM tails. miniaudio's `ma_data_converter_config.dither_mode` exposes the value, but `ma_engine_config` does NOT — the engine builds its own converter graph internally and ignores any external dither setting.
+
+v1.10.11 parses `AGENT_TTS_AUDIO_DITHER` (`triangle` default | `none`) and logs the chosen value at boot:
+
+```
+[audio] v1.10.11 quality knobs: lpf_order=8 headroom_db=-3.0 dither=triangle (engine cfg)
+```
+
+Flipping to `none` produces identical audio today. The env knob is wired so a future patch can replace the engine with a custom `data_callback` over `ma_data_converter` (where we control `dither_mode` directly) without breaking the operator contract. Logged as an honest no-op in the v1.10.11 changelog.
+
 ## Cloned voices (v1.4)
 
 v1.4 adds a **third engine**: `cloned`. Selected automatically when `--voice <slug>` resolves to a directory under `~/.cache/agent-tts/voices/<slug>/` produced by `agent-tts voice clone`.

@@ -168,6 +168,14 @@ Vendored from [zig-gamedev/zaudio](https://github.com/zig-gamedev/zaudio). Linke
 
 `AudioPlayer.streamS16le(samples, 22050)` creates an `AudioBuffer` data source pinned to the source rate (22050 Hz for Faber). Without the explicit sample rate, miniaudio upsamples to the device rate (48000 Hz) and pitch shifts ~2.18× higher — a fix shipped in v1.0. `streamS16leAppend` is the v1.2 alias used by the streaming worker; today it shares `streamS16le`'s body because measured inter-chunk gaps stay below one device period.
 
+**v1.10.11 quality config** — `AudioPlayer.init` now constructs an explicit `zaudio.Engine.Config` instead of passing `null`. Three knobs land at engine create time:
+
+- **Linear resampler LPF order** — `pitch_resampling.linear.lpf_order = 8` (default 0 in miniaudio). Catches the 22050 → 48000 upsample edge for every Sound that mixes through the engine; eliminates sibilant aliasing without measurable CPU cost.
+- **Master gain stage** — `engine.setGainDb(-3.0)` drops the f32 mix by 3 dB before the device-format converter. Faber's stressed vowels can push peaks toward 0 dBFS; -3 dB margin avoids hard clipping at the s16 output.
+- **Dither intent** — `AGENT_TTS_AUDIO_DITHER` parsed and logged; the Engine doesn't expose `dither_mode` so today this is a no-op declaration. The env knob exists so a future custom `data_callback` over `ma_data_converter` can flip dither without breaking the operator contract.
+
+All three are env-overridable: `AGENT_TTS_AUDIO_LPF_ORDER`, `AGENT_TTS_AUDIO_HEADROOM_DB`, `AGENT_TTS_AUDIO_DITHER`. See [`motor.md`](/agent-tts/motor/#onnx-runtime--miniaudio-quality-v11011) for the research provenance.
+
 ### MCP server (v1.5+)
 
 `src/mcp.zig` adds a third entry point: `agent-tts mcp` runs a stdio JSON-RPC 2.0 loop. Newline-delimited JSON (NOT LSP-style `Content-Length` framing — that is the MCP convention for stdio transport). Methods landed in v1.5:

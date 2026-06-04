@@ -9,6 +9,34 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10.11 — ONNX session + miniaudio quality knobs · 2026-06-04
+
+**Why a patch:** v1.10.9 closed the linguistic side of the research note at [`_qa/v1.10.9-research-prompt-output.md`](https://github.com/biliboss/agent-tts/blob/main/_qa/v1.10.9-research-prompt-output.md) (`length=1.05`, `noise=0.35`, `noise_w=0.45` + glossary + identifier normalizer). The same note flagged two inference-layer wins still on the table: (1) ONNX Runtime is multi-threaded by default and contends itself on Apple Silicon's small VITS graph; (2) miniaudio's per-sound resampler runs with `lpfOrder=0` (no LPF) which adds aliasing on the 22050 → 48000 upsample edge. v1.10.11 ships both.
+
+**Shipped:**
+
+- **`src/daemon.zig`** — daemon now calls `setenv("OMP_NUM_THREADS", "1", overwrite=0)` + `ORT_NUM_THREADS=1` + `OMP_THREAD_LIMIT=1` **before** `bootMultiPiper`. ONNX Runtime reads its thread-pool env once at session creation, so the order matters. `overwrite=0` means a CI / power user override still wins. Apple Silicon's P-cores want one hot thread per inference, not four contended ones; the Faber 15M-param VITS is single-graph, not amenable to intra-op parallelism. Boot log gains `[daemon] v1.10.11 onnx env: OMP_NUM_THREADS=1 ORT_NUM_THREADS=1 OMP_THREAD_LIMIT=1`
+- **`src/audio.zig`** — `AudioPlayer.init` now constructs an explicit `zaudio.Engine.Config` with `pitch_resampling.linear.lpf_order = 8` (was 0, miniaudio default) and `resource_manager_resampling.linear.lpf_order = 8`. miniaudio caps `lpf_order` at 8 (`MA_MAX_RESAMPLER_LPF_ORDER`). The per-sound resampler config is populated from `pitchResamplingConfig` for every Sound that mixes through the engine (`miniaudio.c:76587`), so this catches every AudioBuffer the daemon plays. The biquad-instability gotcha (`miniaudio.c:77421` forces `lpfOrder=0` when pitch ≠ 1.0) doesn't apply because we don't pitch-shift
+- **`src/audio.zig`** — `engine.setGainDb(-3.0)` after engine create. Drops the engine master ~3 dB so Faber's stressed vowels at end-of-phrase don't push toward 0 dBFS at the f32 → device-format converter edge. Gain-staged input prevents hard clipping on the loudest 1-2% of frames; perceived loudness drops ~3 dB (no auto-makeup, by design). Boot log gains `[audio] v1.10.11 quality knobs: lpf_order=8 headroom_db=-3.0 dither=triangle`
+- **3 new daemon-wide env knobs** documented in `--help`:
+  - `AGENT_TTS_AUDIO_LPF_ORDER` (0..8, default 8)
+  - `AGENT_TTS_AUDIO_HEADROOM_DB` (default 3 → engine.setGainDb(-3))
+  - `AGENT_TTS_AUDIO_DITHER` (`triangle` default | `none`) — see honest scope
+- VERSION 1.10.11 — binary + bundle
+
+**Validated end-to-end**: `/opt/homebrew/bin/agent-tts --profile tech "Teste de qualidade pós v1.10.11. ONNX e miniaudio configurados."` enqueues → daemon log shows both new boot lines, then `[worker] piper id=185 tech=true length_scale=1.050 noise_scale=0.350 noise_w=0.450 speaker_id=-1 sentence_pause_ms=500` → audible Faber playback at ~3 dB lower loudness vs v1.10.10. `zig build` + `zig build test` exit 0; `zig build -Dwith-piper=true` produces the linked binary (~4.9 MB).
+
+**Honest scope** — the patch level we actually achieved:
+
+- **ONNX session options: env-var fallback, NOT a libpiper patch.** `vendor/piper1-gpl/libpiper/include/piper.h@v1.4.2` exposes 4 public functions — `piper_create`, `piper_free`, `piper_default_synthesize_options`, `piper_synthesize_start/next` — and zero hook for `OrtSessionOptions`. Patching libpiper to take a `piper_create_with_options(model, config, espeak, &ort_opts)` builder would be the principled fix but means forking the upstream. v1.10.11 ships the env-var path because it works through the unmodified libpiper.dylib and ONNX Runtime honours the env at every session create. Documented gap; upgrade target if/when piper1-gpl exposes the hook
+- **Dither is a no-op today.** `zaudio.Engine.Config` does NOT expose `dither_mode` for the internal f32 → device-format converter (`DataConverter.Config.dither_mode` exists on the lower-level type but the Engine builds its own converter graph internally). v1.10.11 parses `AGENT_TTS_AUDIO_DITHER` and logs the chosen value but cannot wire it through without replacing the engine with a custom data_callback over an `ma_data_converter`. The default `triangle` describes intent; flipping to `none` produces identical audio today. Logged so a future v1.10.12+ can flip it after replacing the engine path
+- **`lpf_order=8` is bounded by miniaudio's max** — anything past 8 silently saturates. Documented in motor.md so the `voice_knob_search` and operator stories don't waste cycles on `lpf_order=16`
+- **`-3 dB` is global, not adaptive.** Faber rarely peaks above -1 dBFS on prose; the -3 dB cut leaves comfortable margin but slightly cuts perceived loudness on the rest of the program. Per-utterance peak normalisation would recover that — deferred to a v1.11 postfx track
+
+**Lead-time**: see [`_qa/v1.10.11-leadtime.md`](https://github.com/biliboss/agent-tts/blob/main/_qa/v1.10.11-leadtime.md).
+
+---
+
 ## v1.10.9 — Research-informed tech profile + glossary expansion · 2026-06-04
 
 **Why a patch:** v1.10.8 shipped a working tech-report mode but the Faber defaults (`length_scale=0.95`, `noise_scale=0.667`, `noise_w=0.85`) were guesses. The external LLM research distillation in [`_qa/v1.10.9-research-prompt-output.md`](https://github.com/biliboss/agent-tts/blob/main/_qa/v1.10.9-research-prompt-output.md) anchored the numbers on MCV read-speech evidence — `length=1.05 / noise=0.35 / noise_w=0.45` recovers intelligibility on symbol-heavy strings without flattening prosody. Same research distilled four more missing pieces this version ships: extra acronym/unit/brand glossary entries, a CamelCase splitter, and a path/version/commit-hash/URL normalizer so Piper stops mispronouncing identifiers.
