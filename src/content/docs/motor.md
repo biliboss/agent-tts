@@ -116,6 +116,56 @@ agent-tts --rate 220 "Mais rápido."             # WPM (say only — piper ignor
 
 Persistent config in `~/.config/agent-tts/config.json` planned for v1.1.
 
+## Tuning Piper per call (v1.10.7+)
+
+Three Piper inference knobs are exposed per call. They override any daemon-wide `AGENT_TTS_PIPER_*` env var and the voice config defaults:
+
+| Flag | Range | Default | Effect |
+|---|---|---|---|
+| `--length-scale` | 0.1 – 3.0 | voice default (≈1.0) | <1 = faster; >1 = slower |
+| `--noise-scale` | 0 – 2 | voice default (Faber ≈0.667) | Higher = more prosody variation |
+| `--noise-w` | 0 – 2 | voice default (Faber ≈0.8) | Higher = more pronunciation variation |
+
+Sentinels: omitting a flag (or passing the sentinel `0` for `--length-scale`, negative for the others on the wire) preserves the env-or-voice default. Mix-and-match freely:
+
+```bash
+# Default voice profile
+agent-tts "Olá."
+
+# Warm Faber — slightly slower + softer prosody
+agent-tts --length-scale 1.05 --noise-scale 0.7 --noise-w 0.9 "Olá calmamente."
+
+# Expressive Faber — more pronunciation variety
+agent-tts --noise-w 1.1 "Olá com mais vida."
+
+# Faster reading (matches macOS say rate ≈ 380 wpm)
+agent-tts --length-scale 0.9 "Resumo veloz."
+```
+
+The daemon logs the resolved knobs on every override:
+
+```
+[worker] piper id=42 length_scale=1.050 noise_scale=0.700 noise_w=0.900
+[worker] piper id=42 lang=pt synth=98.3ms play=2147.4ms samples=47312
+```
+
+Same wire travels through MCP — the `say` tool accepts the three optional numeric arguments, and `synth_voice_test(text, length_scale, noise_scale, noise_w)` is a one-shot A/B helper that echoes the resolved knobs back so Claude Code can record a comparison run.
+
+### Recommended Faber profiles
+
+Validated 2026-06-04 against a 35 s reference utterance:
+
+| Profile | length_scale | noise_scale | noise_w | Use case |
+|---|---|---|---|---|
+| **Default** | (unset) | (unset) | (unset) | Baseline Faber |
+| **Warm** | 1.05 | 0.70 | 0.90 | Reading text aloud, calmer flow |
+| **Expressive** | 1.00 | 0.85 | 1.10 | Pitch/announcements, more variety |
+| **Fast** | 0.90 | (unset) | (unset) | Snappy status reports |
+
+### SSML interaction
+
+When `--ssml` is set, `<prosody rate>` inside the markup overrides `--length-scale` per scope (the SSML walker computes `length_scale = 1/rate` per chunk). `--noise-scale` and `--noise-w` still apply globally because the walker doesn't touch those knobs.
+
 ## Cloned voices (v1.4)
 
 v1.4 adds a **third engine**: `cloned`. Selected automatically when `--voice <slug>` resolves to a directory under `~/.cache/agent-tts/voices/<slug>/` produced by `agent-tts voice clone`.

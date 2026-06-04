@@ -1,11 +1,11 @@
 ---
 title: What's next
-description: v1.1 → v1.10.6 all shipped 2026-06-03/04. Next milestones land here when planned.
+description: v1.1 → v1.10.7 all shipped 2026-06-03/04. Next milestones land here when planned.
 ---
 
 ## TL;DR
 
-**The entire v1.6 → v1.10.6 slate shipped on 2026-06-03 / 04**, plus v1.1 → v1.5 earlier the same day. Eighteen base + six patch milestones, all measured.
+**The entire v1.6 → v1.10.7 slate shipped on 2026-06-03 / 04**, plus v1.1 → v1.5 earlier the same day. Eighteen base + seven patch milestones, all measured.
 
 - **v1.6 Voice cloning ship-it** — XTTS-v2 sidecar live; first cloned voice; 5 install blockers fixed
 - **v1.7 Streaming text input** — `agent-tts stream` + `say_stream` MCP tool + incremental chunker
@@ -18,6 +18,7 @@ description: v1.1 → v1.10.6 all shipped 2026-06-03/04. Next milestones land he
 - **v1.10.4 Clone diagnostic** — staged WAV size logged; "Show WAV in Finder" affordance on failed clones
 - **v1.10.5 Daemon sidecar absolute paths** — daemon + CLI probe install roots, fixes launchd-spawn cwd
 - **v1.10.6 XTTS quality tuning** — temperature/top_k/top_p/repetition_penalty env knobs; longer reference window for speaker latents
+- **v1.10.7 Per-call Piper knobs** — `--length-scale` / `--noise-scale` / `--noise-w` flags + matching MCP `say` params + new `synth_voice_test` tool; 8-field ENQUEUE with optional tune triplet; no daemon restart for A/B
 
 See the [Changelog](/agent-tts/changelog/) for measurements + honest scope per version. The next slate (v1.11+) is unscheduled.
 

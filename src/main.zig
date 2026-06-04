@@ -46,7 +46,7 @@ const mcp = @import("mcp.zig");
 const stream_mod = @import("stream.zig");
 const build_options = @import("build_options");
 
-pub const VERSION = "1.10.6";
+pub const VERSION = "1.10.7";
 
 const HELP =
     \\agent-tts v{s} — multilingual TTS via system voice or libpiper
@@ -94,6 +94,9 @@ const HELP =
     \\  --voice NAME        voice name (default: Luciana for say, faber for piper;
     \\                      on Linux Luciana auto-maps to espeak-ng pt-br)
     \\  --rate WPM          words per minute (default: 330; ignored by piper)
+    \\  --length-scale F    v1.10.7+: Piper length_scale (0.1..3.0). <1=faster.
+    \\  --noise-scale F     v1.10.7+: Piper noise_scale (0..2). Higher=more prosody variation.
+    \\  --noise-w F         v1.10.7+: Piper noise_w (0..2). Higher=more pronunciation variation.
     \\  -h, --help          this help
     \\  -V, --version       print version
     \\

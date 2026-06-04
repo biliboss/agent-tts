@@ -40,6 +40,21 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// v1.10.7 — getenv + parseFloat helper. Returns null when the env var is
+/// missing OR fails to parse. Used by `synthToSamplesTuned` to honour
+/// daemon-wide `AGENT_TTS_PIPER_*` overrides when the per-call sentinel
+/// says "unset".
+fn envFloat(name: [*:0]const u8) ?f32 {
+    const stdlib = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const ptr = stdlib.getenv(name);
+    if (ptr == null) return null;
+    const s = std.mem.span(ptr);
+    if (s.len == 0) return null;
+    return std.fmt.parseFloat(f32, s) catch null;
+}
+
 pub const PiperEngine = struct {
     handle: *c.piper_synthesizer,
     voice_path: []const u8,
@@ -120,20 +135,66 @@ pub const PiperEngine = struct {
     /// default). 0.5 doubles speed; 2.0 halves it. Used by the SSML
     /// `<prosody rate>` walker to widen / shrink phoneme duration per
     /// chunk without rebuilding the synthesizer.
+    ///
+    /// v1.10.7 — thin shim over `synthToSamplesTuned` so existing call
+    /// sites (SSML walker) keep their signature while the per-call knob
+    /// path goes through one funnel. Passing `-1` for noise_scale/noise_w
+    /// leaves them at the env-or-voice default.
     pub fn synthToSamplesScaled(
         self: *PiperEngine,
         arena: std.mem.Allocator,
         text: []const u8,
         length_scale: f32,
     ) Error![]i16 {
+        return self.synthToSamplesTuned(arena, text, length_scale, -1.0, -1.0);
+    }
+
+    /// v1.10.7 — synth with all three Piper inference knobs explicit.
+    /// Each `< 0` (or `length_scale == 0`) falls through to:
+    ///   1. `AGENT_TTS_PIPER_LENGTH_SCALE` / `AGENT_TTS_PIPER_NOISE_SCALE`
+    ///      / `AGENT_TTS_PIPER_NOISE_W` environment variables (parsed as
+    ///      f32 once per call), then
+    ///   2. libpiper's default (`piper_default_synthesize_options`).
+    ///
+    /// This precedence keeps the daemon-level env var workflow intact
+    /// while letting any single ENQUEUE message override per call.
+    pub fn synthToSamplesTuned(
+        self: *PiperEngine,
+        arena: std.mem.Allocator,
+        text: []const u8,
+        length_scale: f32,
+        noise_scale: f32,
+        noise_w: f32,
+    ) Error![]i16 {
         const text_z = arena.dupeZ(u8, text) catch return Error.SynthesizeStartFailed;
         defer arena.free(text_z);
 
         var opts: c.piper_synthesize_options = c.piper_default_synthesize_options(self.handle);
-        // length_scale: 0.5 → 2× speed; 2.0 → 0.5× speed.
-        // SSML rate is a multiplier where 0.5 = half speed (slower), so
-        // length_scale = 1/rate.
-        if (length_scale > 0) opts.length_scale = length_scale;
+
+        // Resolve length_scale: per-call > env > libpiper default.
+        const ls = blk: {
+            if (length_scale > 0) break :blk length_scale;
+            if (envFloat("AGENT_TTS_PIPER_LENGTH_SCALE")) |v| break :blk v;
+            break :blk @as(f32, -1.0); // sentinel meaning "don't override"
+        };
+        if (ls > 0) opts.length_scale = ls;
+
+        const ns = blk: {
+            if (noise_scale >= 0) break :blk noise_scale;
+            if (envFloat("AGENT_TTS_PIPER_NOISE_SCALE")) |v| break :blk v;
+            break :blk @as(f32, -1.0);
+        };
+        if (ns >= 0) opts.noise_scale = ns;
+
+        const nw = blk: {
+            if (noise_w >= 0) break :blk noise_w;
+            if (envFloat("AGENT_TTS_PIPER_NOISE_W")) |v| break :blk v;
+            break :blk @as(f32, -1.0);
+        };
+        // libpiper names the field `noise_w_scale`; the public API + docs
+        // call it `noise_w`. We expose `noise_w` everywhere user-facing and
+        // map to the C struct here.
+        if (nw >= 0) opts.noise_w_scale = nw;
 
         const rc_start = c.piper_synthesize_start(self.handle, text_z.ptr, &opts);
         if (rc_start != c.PIPER_OK) return Error.SynthesizeStartFailed;
@@ -246,6 +307,29 @@ pub const MultiPiperEngine = struct {
             .pt => self.pt.synthToSamples(arena, text),
             .en => if (self.en) |*en| en.synthToSamples(arena, text)
             else self.pt.synthToSamples(arena, text),
+        };
+    }
+
+    /// v1.10.7 — synth with explicit per-call Piper inference knobs.
+    /// Sentinel rules (any `< 0`, plus `length_scale == 0`) fall through
+    /// to `AGENT_TTS_PIPER_*` env vars and then libpiper defaults. Worker
+    /// passes the values straight off the popped queue row so a single
+    /// ENQUEUE message can A/B different voices without restart.
+    pub fn synthLangTuned(
+        self: *MultiPiperEngine,
+        arena: std.mem.Allocator,
+        text: []const u8,
+        lang: Route,
+        length_scale: f32,
+        noise_scale: f32,
+        noise_w: f32,
+    ) Error![]i16 {
+        return switch (lang) {
+            .pt => self.pt.synthToSamplesTuned(arena, text, length_scale, noise_scale, noise_w),
+            .en => if (self.en) |*en|
+                en.synthToSamplesTuned(arena, text, length_scale, noise_scale, noise_w)
+            else
+                self.pt.synthToSamplesTuned(arena, text, length_scale, noise_scale, noise_w),
         };
     }
 

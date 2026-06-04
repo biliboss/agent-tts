@@ -9,6 +9,29 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10.7 — Per-call piper knobs · 2026-06-04
+
+**Why a patch:** v1.10.6 added daemon-wide `AGENT_TTS_PIPER_*` env knobs, but A/B testing still required `launchctl kickstart -k` between profiles. Now any single `agent-tts "…"` or MCP `say` call can override `length_scale`, `noise_scale`, and `noise_w` per item — no daemon restart, no envless rewrite.
+
+**Shipped:**
+
+- **`src/ipc.zig`** — `Message` gains `length_scale` (sentinel `0.0`=unset), `noise_scale` (sentinel `<0`=unset), `noise_w` (sentinel `<0`=unset). Wire format becomes 8-field `ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<ssml>\t<tune>\t<text>` where `<tune>` is `length:noise:noise_w` with `-` for any unset component (e.g. `-:-:0.95`) or empty `""` when all defaults. Parser still accepts v0.6/v0.7/v1.1/v1.8 layouts unchanged
+- **`src/queue.zig`** — three new REAL columns (`length_scale`, `noise_scale`, `noise_w`), each NULL when caller didn't override. Idempotent ALTER TABLE migration runs at daemon boot. `replay` preserves NULLs so a default item stays default after re-enqueue
+- **`src/piper.zig`** — new `synthToSamplesTuned(arena, text, length_scale, noise_scale, noise_w)` precedence chain: per-call > `AGENT_TTS_PIPER_*` env > libpiper voice default. `synthToSamplesScaled` becomes a thin shim so the SSML walker keeps its signature. `MultiPiperEngine.synthLangTuned` dispatches to Pt/En per route
+- **`src/daemon.zig`** — `runPiperSingle` + streaming `synthWorker` thread their per-call knobs through, and log `[worker] piper id=N length_scale=… noise_scale=… noise_w=…` whenever any override is set
+- **`src/client.zig`** — `--length-scale <f>` / `--noise-scale <f>` / `--noise-w <f>` flags with range validation (0.1..3.0 / 0..2 / 0..2). New `enqueueLineTuned` (MCP shared) funnels through `ipc.encodeEnqueue`
+- **`src/mcp.zig`** — `say` schema gains three optional number params with range gates. New `synth_voice_test(text, length_scale, noise_scale, noise_w)` tool returns enqueue id + the parsed knobs (helpful for Claude Code A/B sessions). Total: 11 tools
+- VERSION 1.10.7
+
+**Validated end-to-end**: `agent-tts --length-scale 1.05 --noise-scale 0.8 --noise-w 1.0 "Teste warm Faber."` enqueues → daemon log shows `[worker] piper id=… length_scale=1.050 noise_scale=0.800 noise_w=1.000` → audible warm profile. MCP path: `tools/call say` with knobs likewise reaches the daemon.
+
+**Honest scope**:
+- **Sentinels matter** — `length_scale=0.0` means "unset". `noise_scale<0` and `noise_w<0` likewise. Pass real floats to override; omit (or pass the sentinel) to keep the voice/env default
+- **Cloned ignores** — XTTS-v2 has its own (separate) knobs. We don't repurpose `length_scale` for the cloned route in v1.10.7; users wanting cloned tuning continue to use `AGENT_TTS_*` env vars at clone time
+- **SSML still wins length** — when `--ssml` is set, the `<prosody rate>` scope inside the markup overrides any `--length-scale` (the SSML walker computes per-chunk length_scale itself). `noise_scale` / `noise_w` still apply because the walker doesn't touch those
+
+---
+
 ## v1.10.6 — XTTS quality tuning · 2026-06-04
 
 **Why a patch:** v1.10.5 made the daemon find `voice_synth.py`, but the first cloned voice still sounded generic. Coqui XTTS-v2 has well-known faithfulness knobs none of which were exposed before — defaults bias toward variety + length stability over speaker fidelity.

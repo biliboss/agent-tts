@@ -34,7 +34,7 @@ const ipc = @import("ipc.zig");
 const client = @import("client.zig");
 const preproc = @import("preproc.zig");
 
-pub const VERSION = "1.10.2";
+pub const VERSION = "1.10.7";
 pub const PROTOCOL_VERSION = "2024-11-05";
 
 const READ_BUF = 256 * 1024; // long agent monologues hit ~8 KB after escaping
@@ -208,7 +208,7 @@ fn buildInitializeResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
 
 fn buildToolsListResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
     const tools = try arr(a, &.{
-        try toolDescriptor(a, "say", "Enqueue Pt-BR TTS on the running daemon. Returns the queue item id.", try saySchema(a)),
+        try toolDescriptor(a, "say", "Enqueue Pt-BR TTS on the running daemon. Returns the queue item id. v1.10.7: optional length_scale / noise_scale / noise_w override piper inference per call.", try saySchema(a)),
         try toolDescriptor(a, "queue", "List items currently in the TTS queue (pending + playing).", try emptySchema(a)),
         try toolDescriptor(a, "skip", "Skip the currently playing TTS item. Returns the skipped id (0 = nothing playing).", try skipSchema(a)),
         try toolDescriptor(a, "clear", "Drop all pending TTS items. Returns the number dropped.", try emptySchema(a)),
@@ -219,6 +219,8 @@ fn buildToolsListResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
         try toolDescriptor(a, "resume", "Resume a paused item. Returns the resumed item id (0 = not paused).", try emptySchema(a)),
         try toolDescriptor(a, "replay", "Re-enqueue a past item by id (any state). Returns the new pending id (0 = item not found).", try replaySchema(a)),
         try toolDescriptor(a, "history", "List the last N items, including done/skipped. Default limit 20, max 100.", try historySchema(a)),
+        // v1.10.7 — A/B helper for piper inference knobs.
+        try toolDescriptor(a, "synth_voice_test", "Enqueue a one-shot piper synth with explicit length_scale / noise_scale / noise_w. Returns the enqueue id plus the resolved knobs so an agent can A/B Faber profiles without daemon restart.", try synthVoiceTestSchema(a)),
     });
     const result = try obj(a, &.{
         .{ "tools", tools },
@@ -266,6 +268,20 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
         .{ "type", str("boolean") },
         .{ "description", str("v1.8+: treat text as W3C SSML 1.1 subset (<emphasis>, <break>, <prosody>, <say-as>). Default false.") },
     });
+    // v1.10.7 — per-call piper inference knobs. Omit to keep daemon
+    // env / voice defaults; valid ranges enforced in callSay.
+    const length_scale_prop = try obj(a, &.{
+        .{ "type", str("number") },
+        .{ "description", str("v1.10.7+: Piper length_scale (0.1..3.0). 1.0=default, <1=faster, >1=slower. Omit to keep voice/env default. Ignored for engine=say.") },
+    });
+    const noise_scale_prop = try obj(a, &.{
+        .{ "type", str("number") },
+        .{ "description", str("v1.10.7+: Piper noise_scale (0..2). Higher = more prosody variation. Omit to keep voice/env default. Faber sweet spot ~0.667. Ignored for engine=say.") },
+    });
+    const noise_w_prop = try obj(a, &.{
+        .{ "type", str("number") },
+        .{ "description", str("v1.10.7+: Piper noise_w (0..2). Higher = more pronunciation variation. Omit to keep voice/env default. Faber sweet spot ~0.8. Ignored for engine=say.") },
+    });
 
     const props = try obj(a, &.{
         .{ "text", text_prop },
@@ -273,9 +289,43 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
         .{ "voice", voice_prop },
         .{ "rate", rate_prop },
         .{ "ssml", ssml_prop },
+        .{ "length_scale", length_scale_prop },
+        .{ "noise_scale", noise_scale_prop },
+        .{ "noise_w", noise_w_prop },
     });
     const required = try arr(a, &.{str("text")});
 
+    return try obj(a, &.{
+        .{ "type", str("object") },
+        .{ "properties", props },
+        .{ "required", required },
+    });
+}
+
+fn synthVoiceTestSchema(a: std.mem.Allocator) !json.Value {
+    const text_prop = try obj(a, &.{
+        .{ "type", str("string") },
+        .{ "description", str("Sentence to synthesize. Always routed to piper Faber (Pt) so the knob effect is comparable across runs.") },
+    });
+    const length_scale_prop = try obj(a, &.{
+        .{ "type", str("number") },
+        .{ "description", str("Piper length_scale (0.1..3.0). 1.0=default, <1=faster.") },
+    });
+    const noise_scale_prop = try obj(a, &.{
+        .{ "type", str("number") },
+        .{ "description", str("Piper noise_scale (0..2). Higher = more prosody variation.") },
+    });
+    const noise_w_prop = try obj(a, &.{
+        .{ "type", str("number") },
+        .{ "description", str("Piper noise_w (0..2). Higher = more pronunciation variation.") },
+    });
+    const props = try obj(a, &.{
+        .{ "text", text_prop },
+        .{ "length_scale", length_scale_prop },
+        .{ "noise_scale", noise_scale_prop },
+        .{ "noise_w", noise_w_prop },
+    });
+    const required = try arr(a, &.{str("text")});
     return try obj(a, &.{
         .{ "type", str("object") },
         .{ "properties", props },
@@ -409,6 +459,8 @@ fn buildToolsCallResponse(
     if (std.mem.eql(u8, tool, "resume")) return callResume(a, io, home, id);
     if (std.mem.eql(u8, tool, "replay")) return callReplay(a, io, home, id, args_val);
     if (std.mem.eql(u8, tool, "history")) return callHistory(a, io, home, id, args_val);
+    // v1.10.7 — A/B Faber profiles inline.
+    if (std.mem.eql(u8, tool, "synth_voice_test")) return callSynthVoiceTest(a, io, home, id, args_val);
 
     return try toolErrorResponse(a, id, "unknown tool");
 }
@@ -539,7 +591,28 @@ fn callSay(
         ssml_flag = s.bool;
     }
 
-    const id_str = client.enqueueLineSsml(a, io, home, engine, voice, rate, text, ssml_flag) catch |e| switch (e) {
+    // v1.10.7 — per-call piper knobs. Each is optional; reject out-of-
+    // range numerics here so the daemon doesn't have to.
+    var length_scale: f32 = 0.0;
+    if (ao.get("length_scale")) |v| {
+        const f = try jsonNumberToF32(v) orelse return try toolErrorResponse(a, id, "length_scale must be a number");
+        if (f < 0.1 or f > 3.0) return try toolErrorResponse(a, id, "length_scale out of range (0.1..3.0)");
+        length_scale = f;
+    }
+    var noise_scale: f32 = -1.0;
+    if (ao.get("noise_scale")) |v| {
+        const f = try jsonNumberToF32(v) orelse return try toolErrorResponse(a, id, "noise_scale must be a number");
+        if (f < 0.0 or f > 2.0) return try toolErrorResponse(a, id, "noise_scale out of range (0..2)");
+        noise_scale = f;
+    }
+    var noise_w: f32 = -1.0;
+    if (ao.get("noise_w")) |v| {
+        const f = try jsonNumberToF32(v) orelse return try toolErrorResponse(a, id, "noise_w must be a number");
+        if (f < 0.0 or f > 2.0) return try toolErrorResponse(a, id, "noise_w out of range (0..2)");
+        noise_w = f;
+    }
+
+    const id_str = client.enqueueLineTuned(a, io, home, engine, voice, rate, text, ssml_flag, length_scale, noise_scale, noise_w) catch |e| switch (e) {
         error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running — start with `agent-tts daemon` or `agent-tts daemon install`"),
         error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error"),
         error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon returned an unexpected response"),
@@ -588,6 +661,81 @@ fn callSkip(a: std.mem.Allocator, io: std.Io, home: []const u8, id: json.Value) 
     };
     const payload = try obj(a, &.{
         .{ "skipped_id", int(@intCast(skipped)) },
+    });
+    const text_block = try formatJsonAsText(a, payload);
+    return try toolTextResponse(a, id, text_block);
+}
+
+// v1.10.7 — accept both integer (json.Value.integer) and float
+// (json.Value.float) for the piper knobs. Strings/other types return null
+// so callers can surface a typed error. Returns an optional because
+// `error` would require sloppy union returns; pure null is cleaner.
+fn jsonNumberToF32(v: json.Value) !?f32 {
+    return switch (v) {
+        .integer => |i| @as(f32, @floatFromInt(i)),
+        .float => |f| @as(f32, @floatCast(f)),
+        else => null,
+    };
+}
+
+fn callSynthVoiceTest(
+    a: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    id: json.Value,
+    args: json.Value,
+) ![]const u8 {
+    if (args != .object) return try toolErrorResponse(a, id, "arguments must be an object");
+    const ao = args.object;
+
+    const text_val = ao.get("text") orelse return try toolErrorResponse(a, id, "text is required");
+    if (text_val != .string) return try toolErrorResponse(a, id, "text must be a string");
+    const text = text_val.string;
+
+    var length_scale: f32 = 0.0;
+    if (ao.get("length_scale")) |v| {
+        const f = try jsonNumberToF32(v) orelse return try toolErrorResponse(a, id, "length_scale must be a number");
+        if (f < 0.1 or f > 3.0) return try toolErrorResponse(a, id, "length_scale out of range (0.1..3.0)");
+        length_scale = f;
+    }
+    var noise_scale: f32 = -1.0;
+    if (ao.get("noise_scale")) |v| {
+        const f = try jsonNumberToF32(v) orelse return try toolErrorResponse(a, id, "noise_scale must be a number");
+        if (f < 0.0 or f > 2.0) return try toolErrorResponse(a, id, "noise_scale out of range (0..2)");
+        noise_scale = f;
+    }
+    var noise_w: f32 = -1.0;
+    if (ao.get("noise_w")) |v| {
+        const f = try jsonNumberToF32(v) orelse return try toolErrorResponse(a, id, "noise_w must be a number");
+        if (f < 0.0 or f > 2.0) return try toolErrorResponse(a, id, "noise_w out of range (0..2)");
+        noise_w = f;
+    }
+
+    const id_str = client.enqueueLineTuned(
+        a,
+        io,
+        home,
+        .piper,
+        "faber",
+        client.DEFAULT_RATE,
+        text,
+        false,
+        length_scale,
+        noise_scale,
+        noise_w,
+    ) catch |e| switch (e) {
+        error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
+        error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error"),
+        error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon returned an unexpected response"),
+        else => return e,
+    };
+
+    // Echo the resolved knobs so the caller can record their A/B parameters.
+    const payload = try obj(a, &.{
+        .{ "id", str(id_str) },
+        .{ "length_scale", json.Value{ .float = @floatCast(length_scale) } },
+        .{ "noise_scale", json.Value{ .float = @floatCast(noise_scale) } },
+        .{ "noise_w", json.Value{ .float = @floatCast(noise_w) } },
     });
     const text_block = try formatJsonAsText(a, payload);
     return try toolTextResponse(a, id, text_block);
@@ -866,7 +1014,7 @@ test "build initialize response shape" {
     try std.testing.expectEqual(false, tools.get("listChanged").?.bool);
 }
 
-test "build tools/list returns 10 tools (v1.10.2 + history/pause/resume/replay)" {
+test "build tools/list returns 11 tools (v1.10.7 + synth_voice_test)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -874,10 +1022,10 @@ test "build tools/list returns 10 tools (v1.10.2 + history/pause/resume/replay)"
     const resp = try buildToolsListResponse(a, .{ .integer = 2 });
     const parsed = try json.parseFromSliceLeaky(json.Value, a, resp, .{});
     const tools = parsed.object.get("result").?.object.get("tools").?.array;
-    try std.testing.expectEqual(@as(usize, 10), tools.items.len);
+    try std.testing.expectEqual(@as(usize, 11), tools.items.len);
 
     // Spot-check names. Order is fixed:
-    //   say/queue/skip/clear/voices/say_stream/pause/resume/replay/history.
+    //   say/queue/skip/clear/voices/say_stream/pause/resume/replay/history/synth_voice_test.
     try std.testing.expectEqualStrings("say", tools.items[0].object.get("name").?.string);
     try std.testing.expectEqualStrings("queue", tools.items[1].object.get("name").?.string);
     try std.testing.expectEqualStrings("skip", tools.items[2].object.get("name").?.string);
@@ -888,12 +1036,40 @@ test "build tools/list returns 10 tools (v1.10.2 + history/pause/resume/replay)"
     try std.testing.expectEqualStrings("resume", tools.items[7].object.get("name").?.string);
     try std.testing.expectEqualStrings("replay", tools.items[8].object.get("name").?.string);
     try std.testing.expectEqualStrings("history", tools.items[9].object.get("name").?.string);
+    try std.testing.expectEqualStrings("synth_voice_test", tools.items[10].object.get("name").?.string);
 
     // Every tool has an inputSchema with type=object.
     for (tools.items) |t| {
         const schema = t.object.get("inputSchema").?.object;
         try std.testing.expectEqualStrings("object", schema.get("type").?.string);
     }
+}
+
+test "v1.10.7 say schema exposes length_scale/noise_scale/noise_w" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try saySchema(a);
+    const props = schema.object.get("properties").?.object;
+    try std.testing.expect(props.get("length_scale") != null);
+    try std.testing.expect(props.get("noise_scale") != null);
+    try std.testing.expect(props.get("noise_w") != null);
+    try std.testing.expectEqualStrings("number", props.get("length_scale").?.object.get("type").?.string);
+}
+
+test "v1.10.7 synth_voice_test schema requires text and exposes 3 knobs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try synthVoiceTestSchema(a);
+    const props = schema.object.get("properties").?.object;
+    try std.testing.expect(props.get("text") != null);
+    try std.testing.expect(props.get("length_scale") != null);
+    try std.testing.expect(props.get("noise_scale") != null);
+    try std.testing.expect(props.get("noise_w") != null);
+    const required = schema.object.get("required").?.array;
+    try std.testing.expectEqual(@as(usize, 1), required.items.len);
+    try std.testing.expectEqualStrings("text", required.items[0].string);
 }
 
 test "parse tools/call request for say" {

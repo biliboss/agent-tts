@@ -47,6 +47,12 @@ const HELP =
     \\  --rate WPM          words per minute (default: 330; ignored by piper)
     \\  --ssml              treat text as W3C SSML 1.1 subset (v1.8+;
     \\                      <emphasis> <break> <prosody> <say-as>)
+    \\  --length-scale F    Piper length_scale (v1.10.7+; 0.5..2.0; 0=unset).
+    \\                      <1 = faster; >1 = slower.
+    \\  --noise-scale F     Piper noise_scale (v1.10.7+; 0..2; <0=unset).
+    \\                      Higher = more prosody variation.
+    \\  --noise-w F         Piper noise_w (v1.10.7+; 0..2; <0=unset).
+    \\                      Higher = more pronunciation variation.
     \\  -h, --help          this help
     \\  -V, --version       print version
     \\
@@ -76,6 +82,10 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     var voice_arg: ?[]const u8 = null;
     var rate: u32 = DEFAULT_RATE;
     var ssml_flag: bool = false;
+    // v1.10.7 — per-call piper knobs. Sentinels match ipc.Message.
+    var length_scale: f32 = 0.0;
+    var noise_scale: f32 = -1.0;
+    var noise_w: f32 = -1.0;
     var text: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -123,6 +133,48 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
             // v1.8 — boolean toggle. Daemon parses W3C SSML subset.
             // Skip sanitisation of `<`/`>` so markup survives.
             ssml_flag = true;
+        } else if (std.mem.eql(u8, a, "--length-scale")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --length-scale needs value\n", .{});
+                std.process.exit(2);
+            }
+            length_scale = std.fmt.parseFloat(f32, args[i]) catch {
+                std.debug.print("error: --length-scale invalid (got '{s}')\n", .{args[i]});
+                std.process.exit(2);
+            };
+            if (length_scale < 0.1 or length_scale > 3.0) {
+                std.debug.print("error: --length-scale out of range (0.1..3.0)\n", .{});
+                std.process.exit(2);
+            }
+        } else if (std.mem.eql(u8, a, "--noise-scale")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --noise-scale needs value\n", .{});
+                std.process.exit(2);
+            }
+            noise_scale = std.fmt.parseFloat(f32, args[i]) catch {
+                std.debug.print("error: --noise-scale invalid (got '{s}')\n", .{args[i]});
+                std.process.exit(2);
+            };
+            if (noise_scale < 0 or noise_scale > 2.0) {
+                std.debug.print("error: --noise-scale out of range (0..2)\n", .{});
+                std.process.exit(2);
+            }
+        } else if (std.mem.eql(u8, a, "--noise-w")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --noise-w needs value\n", .{});
+                std.process.exit(2);
+            }
+            noise_w = std.fmt.parseFloat(f32, args[i]) catch {
+                std.debug.print("error: --noise-w invalid (got '{s}')\n", .{args[i]});
+                std.process.exit(2);
+            };
+            if (noise_w < 0 or noise_w > 2.0) {
+                std.debug.print("error: --noise-w out of range (0..2)\n", .{});
+                std.process.exit(2);
+            }
         } else {
             text = a;
         }
@@ -164,6 +216,9 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
         .voice = voice,
         .rate = rate,
         .ssml = ssml_flag,
+        .length_scale = length_scale,
+        .noise_scale = noise_scale,
+        .noise_w = noise_w,
         .text = clean,
     };
 
@@ -176,14 +231,11 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     var sw = stream.writer(io, &write_buf);
 
     const t_start = std.Io.Clock.now(.awake, io);
-    // v1.8 7-field ENQUEUE: engine, lang, voice, rate, ssml, text. Daemon
-    // handles older 4/5/6-field forms for ABI compatibility — see
-    // ipc.parseRequest for the disambiguation rules.
-    const ssml_wire: []const u8 = if (msg.ssml) "1" else "0";
-    try sw.interface.print(
-        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\n",
-        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_wire, msg.text },
-    );
+    // v1.10.7 — single funnel through ipc.encodeEnqueue so the 8-field
+    // wire format with optional tune triplet stays in one place. Daemon
+    // handles older 4/5/6/7-field forms for ABI compatibility.
+    const wire = try ipc.encodeEnqueue(arena, msg);
+    try sw.interface.writeAll(wire);
     try sw.interface.flush();
 
     const line = try sr.interface.takeDelimiterExclusive('\n');
@@ -519,12 +571,35 @@ pub fn enqueueLineSsml(
     text: []const u8,
     ssml_flag: bool,
 ) ![]u8 {
+    return enqueueLineTuned(arena, io, home, engine, voice, rate, text, ssml_flag, 0.0, -1.0, -1.0);
+}
+
+/// v1.10.7 — enqueue with all per-call piper inference knobs. Pass the
+/// sentinels (`length_scale=0`, `noise_scale=-1`, `noise_w=-1`) when the
+/// caller doesn't want to override. MCP `say` tool exposes the three
+/// optional numeric arguments and funnels through this entry point.
+pub fn enqueueLineTuned(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    engine: ipc.Engine,
+    voice: []const u8,
+    rate: u32,
+    text: []const u8,
+    ssml_flag: bool,
+    length_scale: f32,
+    noise_scale: f32,
+    noise_w: f32,
+) ![]u8 {
     const clean = try ipc.sanitizeText(arena, text);
     const msg = ipc.Message{
         .engine = engine,
         .voice = voice,
         .rate = rate,
         .ssml = ssml_flag,
+        .length_scale = length_scale,
+        .noise_scale = noise_scale,
+        .noise_w = noise_w,
         .text = clean,
     };
 
@@ -536,11 +611,8 @@ pub fn enqueueLineSsml(
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);
 
-    const ssml_wire: []const u8 = if (msg.ssml) "1" else "0";
-    try sw.interface.print(
-        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\n",
-        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_wire, msg.text },
-    );
+    const wire = try ipc.encodeEnqueue(arena, msg);
+    try sw.interface.writeAll(wire);
     try sw.interface.flush();
 
     const line = try sr.interface.takeDelimiterExclusive('\n');

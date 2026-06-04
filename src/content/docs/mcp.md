@@ -5,7 +5,7 @@ description: Native Claude Code / Cursor / Cline voice — agent-tts speaks via 
 
 ## TL;DR
 
-`agent-tts mcp` runs a stdio JSON-RPC 2.0 server that exposes the daemon to any [Model Context Protocol](https://modelcontextprotocol.io) client. Claude Code, Cursor, Cline, Continue — same wire, same **10 tools** (v1.10.2). No shell-out, no permission prompt per call, no stdout parsing.
+`agent-tts mcp` runs a stdio JSON-RPC 2.0 server that exposes the daemon to any [Model Context Protocol](https://modelcontextprotocol.io) client. Claude Code, Cursor, Cline, Continue — same wire, same **11 tools** (v1.10.7). No shell-out, no permission prompt per call, no stdout parsing.
 
 Bundled in the same Zig binary as the CLI and the daemon. `+115 KB` over v1.0. Tools only — `prompts/`, `resources/`, `sampling/` are deferred.
 
@@ -38,13 +38,13 @@ Then restart Claude Code (or your client) so it picks up the new server. Verify:
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | agent-tts mcp
 ```
 
-You should get back a single JSON line listing the 10 tools.
+You should get back a single JSON line listing the 11 tools.
 
-## The 10 tools
+## The 11 tools
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `say` | `{ text, engine?, voice?, rate?, ssml? }` | `{ id }` |
+| `say` | `{ text, engine?, voice?, rate?, ssml?, length_scale?, noise_scale?, noise_w? }` | `{ id }` |
 | `queue` | `{}` | `{ items: [...] }` |
 | `skip` | `{ id? }` (ignored in v1.5) | `{ skipped_id }` |
 | `clear` | `{}` | `{ cleared_count }` |
@@ -54,6 +54,19 @@ You should get back a single JSON line listing the 10 tools.
 | `resume` (v1.10.2+) | `{}` | `{ resumed_id }` (0 = not paused) |
 | `replay` (v1.10.2+) | `{ id }` | `{ new_id }` (0 = item not found) |
 | `history` (v1.10.2+) | `{ limit? }` (1..100, default 20) | `{ items: [{id,state,engine,voice,rate,finished_at,text}, ...] }` |
+| `synth_voice_test` (v1.10.7+) | `{ text, length_scale?, noise_scale?, noise_w? }` | `{ id, length_scale, noise_scale, noise_w }` |
+
+### v1.10.7 — Per-call Piper knobs on `say`
+
+The `say` tool gains three optional numeric parameters that override Piper inference per call. Each is honored only when the daemon routes to `engine=piper` (or implicitly via voice resolution):
+
+| Parameter | Range | Effect |
+|---|---|---|
+| `length_scale` | 0.1 – 3.0 | <1 = faster; >1 = slower. Overrides `<prosody rate>` only outside SSML markup. |
+| `noise_scale` | 0 – 2 | Higher = more prosody variation. Faber sweet spot ≈0.667. |
+| `noise_w` | 0 – 2 | Higher = more pronunciation variation. Faber sweet spot ≈0.8. |
+
+Use `synth_voice_test` as an A/B helper — it always routes to Faber and echoes the resolved knobs in the response so an agent can record the experiment.
 
 Each tool is a thin shim over the same UNIX socket the CLI uses. No new daemon code beyond the v1.10.2 ops the four new tools wrap. Tool errors (daemon down, malformed args) come back as `isError: true` MCP responses with a human-readable text block — the JSON-RPC envelope only errors on parse failures (`-32700`) or unknown methods (`-32601`).
 

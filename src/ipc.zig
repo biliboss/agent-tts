@@ -4,27 +4,37 @@
 // Transport: UNIX stream socket at $HOME/.cache/agent-tts/sock
 //
 // Request lines (one per connection):
-//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<ssml>\t<text>\n → v1.8 7-field form
-//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<text>\n         → v1.1 6-field form
-//   ENQUEUE\t<engine>\t<voice>\t<rate>\t<text>\n                 → v0.7 5-field form
-//   ENQUEUE\t<voice>\t<rate>\t<text>\n                           → v0.6 4-field form
-//   QUEUE\n                                                      → list items
-//   SKIP\n                                                       → skip current
-//   CLEAR\n                                                      → drop pending
+//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<ssml>\t<tune>\t<text>\n → v1.10.7 8-field form
+//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<ssml>\t<text>\n        → v1.8 7-field form
+//   ENQUEUE\t<engine>\t<lang>\t<voice>\t<rate>\t<text>\n                → v1.1 6-field form
+//   ENQUEUE\t<engine>\t<voice>\t<rate>\t<text>\n                        → v0.7 5-field form
+//   ENQUEUE\t<voice>\t<rate>\t<text>\n                                  → v0.6 4-field form
+//   QUEUE\n                                                             → list items
+//   SKIP\n                                                              → skip current
+//   CLEAR\n                                                             → drop pending
 //
 // Backward compat (parseRequest):
 //   1. Peek first token after ENQUEUE.
 //      - Engine.fromStr matches      → new layout (v0.7+)
 //      - Not an engine               → legacy v0.6 (token is the voice)
 //   2. In new layout, peek the second token.
-//      - Lang.fromStr matches        → v1.1+ (6-field or 7-field)
+//      - Lang.fromStr matches        → v1.1+ (6/7/8-field)
 //      - Not a lang                  → v0.7 5-field (token is the voice)
 //   3. In v1.1+ layout, peek the field after the rate.
-//      - "0" / "1" exactly           → v1.8 7-field (token is the ssml flag)
+//      - "0" / "1" exactly           → v1.8+ 7- or 8-field (token is ssml flag)
 //      - Anything else               → v1.1 6-field (rest is text)
+//   4. In v1.8+ layout, peek the field after the ssml flag.
+//      - empty "" OR contains ':'    → v1.10.7 8-field (token is the tune triplet)
+//      - Anything else               → v1.8 7-field (rest is text)
 //
-// Lang defaults to `.auto` and ssml defaults to `false` when absent so
-// v0.6/v0.7/v1.1 clients keep working unchanged.
+// Tune triplet format (v1.10.7 8-field): `<length>:<noise>:<noise_w>`. Each
+// component is either a float literal (e.g. `1.05`) or `-` for unset. An
+// entirely-empty field also means "all unset". Sentinels: `length_scale = 0`
+// AND `noise_scale < 0` AND `noise_w < 0` all mean "use voice/env default".
+//
+// Lang defaults to `.auto`, ssml defaults to `false`, and the tune knobs
+// default to their unset sentinels when absent so v0.6/v0.7/v1.1/v1.8 clients
+// keep working unchanged.
 //
 // Response lines:
 //   OK\t<id>\n                           → enqueue/skip/clear ack
@@ -87,6 +97,16 @@ pub const Message = struct {
     /// `true`, the daemon parses SSML, applies engine-specific transpile
     /// (say → [[…]] directives, piper → prosody scaling), then routes.
     ssml: bool = false,
+    /// v1.10.7 — per-call piper inference knobs. Sentinel `0.0` means
+    /// "use voice / env / built-in default" so older callers that don't
+    /// set the field keep the legacy behaviour. Range when set: 0.1..3.0.
+    length_scale: f32 = 0.0,
+    /// v1.10.7 — Piper noise_scale knob. Sentinel `< 0` means unset.
+    /// Range when set: 0.0..2.0. Higher = more variation in prosody.
+    noise_scale: f32 = -1.0,
+    /// v1.10.7 — Piper noise_w knob. Sentinel `< 0` means unset.
+    /// Range when set: 0.0..2.0. Higher = more variation in pronunciation.
+    noise_w: f32 = -1.0,
     text: []const u8,
 };
 
@@ -135,16 +155,102 @@ pub fn sanitizeText(arena: std.mem.Allocator, raw: []const u8) ![]u8 {
 }
 
 pub fn encodeEnqueue(arena: std.mem.Allocator, msg: Message) ![]u8 {
-    // v1.8 wire format: 7 fields. Daemon parser recognises the ssml flag
-    // by exact "0"/"1" match between rate and text — anything else (e.g.
-    // a v1.1 client's text starting with a digit followed by a tab) falls
-    // back to v1.1 6-field parsing.
+    // v1.10.7 wire format: 8 fields. The tune triplet between ssml and text
+    // carries optional piper inference knobs. When all three are at their
+    // unset sentinels, we emit an empty `""` field so the daemon parser
+    // distinguishes 8-field-with-defaults from 7-field (which has text in
+    // that slot — but text is never empty).
     const ssml_str: []const u8 = if (msg.ssml) "1" else "0";
+    const tune = try formatTuneTriplet(arena, msg.length_scale, msg.noise_scale, msg.noise_w);
     return try std.fmt.allocPrint(
         arena,
-        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\n",
-        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_str, msg.text },
+        "ENQUEUE\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\t{s}\n",
+        .{ msg.engine.str(), msg.lang.str(), msg.voice, msg.rate, ssml_str, tune, msg.text },
     );
+}
+
+/// v1.10.7 — format the per-call tune triplet for the 8-field wire.
+/// Each unset component is encoded as `-`; all-unset returns an empty
+/// string so the parser can short-circuit the common case.
+pub fn formatTuneTriplet(
+    arena: std.mem.Allocator,
+    length_scale: f32,
+    noise_scale: f32,
+    noise_w: f32,
+) ![]u8 {
+    const len_set = length_scale > 0;
+    const ns_set = noise_scale >= 0;
+    const nw_set = noise_w >= 0;
+    if (!len_set and !ns_set and !nw_set) return try arena.dupe(u8, "");
+
+    var len_buf: [32]u8 = undefined;
+    var ns_buf: [32]u8 = undefined;
+    var nw_buf: [32]u8 = undefined;
+    const len_str: []const u8 = if (len_set)
+        try std.fmt.bufPrint(&len_buf, "{d}", .{length_scale})
+    else
+        "-";
+    const ns_str: []const u8 = if (ns_set)
+        try std.fmt.bufPrint(&ns_buf, "{d}", .{noise_scale})
+    else
+        "-";
+    const nw_str: []const u8 = if (nw_set)
+        try std.fmt.bufPrint(&nw_buf, "{d}", .{noise_w})
+    else
+        "-";
+    return try std.fmt.allocPrint(arena, "{s}:{s}:{s}", .{ len_str, ns_str, nw_str });
+}
+
+/// v1.10.7 — parse a tune triplet of the form `<length>:<noise>:<noise_w>`.
+/// Components may be `-` (or empty) to leave the corresponding knob at its
+/// sentinel default. Empty input returns all-sentinels. Returns
+/// `error.Malformed` on shape errors (wrong colon count, invalid float).
+pub const TuneTriplet = struct {
+    length_scale: f32,
+    noise_scale: f32,
+    noise_w: f32,
+};
+
+pub fn parseTuneTriplet(s: []const u8) ParseError!TuneTriplet {
+    var out: TuneTriplet = .{
+        .length_scale = 0.0,
+        .noise_scale = -1.0,
+        .noise_w = -1.0,
+    };
+    if (s.len == 0) return out;
+
+    var it = std.mem.splitScalar(u8, s, ':');
+    const a = it.next() orelse return error.Malformed;
+    const b = it.next() orelse return error.Malformed;
+    const c = it.next() orelse return error.Malformed;
+    if (it.next() != null) return error.Malformed;
+
+    if (a.len > 0 and !std.mem.eql(u8, a, "-")) {
+        out.length_scale = std.fmt.parseFloat(f32, a) catch return error.Malformed;
+    }
+    if (b.len > 0 and !std.mem.eql(u8, b, "-")) {
+        out.noise_scale = std.fmt.parseFloat(f32, b) catch return error.Malformed;
+    }
+    if (c.len > 0 and !std.mem.eql(u8, c, "-")) {
+        out.noise_w = std.fmt.parseFloat(f32, c) catch return error.Malformed;
+    }
+    return out;
+}
+
+/// v1.10.7 — detect whether the field between ssml and text is a tune
+/// triplet (8-field form) versus the text itself (7-field form). An empty
+/// field IS the tune slot — text is never empty post-sanitization. A field
+/// containing `:` AND only `[0-9.\-:]` characters is also unambiguously a
+/// tune triplet; the 7-field text could in principle contain `:` (e.g.
+/// "10:30") so we additionally require all characters to look numeric.
+fn looksLikeTuneTriplet(s: []const u8) bool {
+    if (s.len == 0) return true;
+    if (std.mem.indexOfScalar(u8, s, ':') == null) return false;
+    for (s) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == ':';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 pub const ParseError = error{ Malformed, UnknownOp, InvalidRate };
@@ -173,15 +279,62 @@ pub fn parseRequest(arena: std.mem.Allocator, line: []const u8) ParseError!Reque
                 // longer than one byte or not in {'0','1'} keeps the
                 // v1.1 6-field shape (after_rate IS the text).
                 if (after_rate.len == 1 and (after_rate[0] == '0' or after_rate[0] == '1')) {
-                    const text = it.rest();
-                    if (text.len == 0) return error.Malformed;
-                    const text_dup = arena.dupe(u8, text) catch return error.Malformed;
+                    const ssml_flag = after_rate[0] == '1';
+                    // v1.10.7: peek the next field to disambiguate 7- vs 8-
+                    // field. The 8-field form inserts a tune triplet between
+                    // ssml and text (`<length>:<noise>:<noise_w>` or empty).
+                    // The 7-field form puts text here directly. Differ:
+                    //   - empty field => always the tune slot (text never empty)
+                    //   - looks like tune triplet => 8-field
+                    //   - otherwise => 7-field, this token IS the first text segment
+                    const peek = it.next() orelse {
+                        // No more fields means after_rate must have been text
+                        // for v1.8 — but that requires text="0"/"1" which is
+                        // possible. Honor it.
+                        return error.Malformed;
+                    };
+
+                    if (looksLikeTuneTriplet(peek)) {
+                        // v1.10.7 8-field path. Parse the tune triplet,
+                        // remainder is the text.
+                        const tune = try parseTuneTriplet(peek);
+                        const text = it.rest();
+                        if (text.len == 0) return error.Malformed;
+                        const text_dup = arena.dupe(u8, text) catch return error.Malformed;
+                        return .{ .enqueue = .{
+                            .engine = engine,
+                            .lang = lang,
+                            .voice = voice_dup,
+                            .rate = rate,
+                            .ssml = ssml_flag,
+                            .length_scale = tune.length_scale,
+                            .noise_scale = tune.noise_scale,
+                            .noise_w = tune.noise_w,
+                            .text = text_dup,
+                        } };
+                    }
+
+                    // v1.8 7-field path: `peek` is the first text segment;
+                    // splice with whatever the iterator still has.
+                    const rest_after = it.rest();
+                    const text_dup = blk2: {
+                        if (rest_after.len == 0) {
+                            const dup = arena.dupe(u8, peek) catch return error.Malformed;
+                            break :blk2 dup;
+                        }
+                        const total = arena.alloc(u8, peek.len + 1 + rest_after.len) catch return error.Malformed;
+                        @memcpy(total[0..peek.len], peek);
+                        total[peek.len] = '\t';
+                        @memcpy(total[peek.len + 1 ..], rest_after);
+                        break :blk2 total;
+                    };
+                    if (text_dup.len == 0) return error.Malformed;
                     return .{ .enqueue = .{
                         .engine = engine,
                         .lang = lang,
                         .voice = voice_dup,
                         .rate = rate,
-                        .ssml = after_rate[0] == '1',
+                        .ssml = ssml_flag,
                         .text = text_dup,
                     } };
                 }
@@ -507,4 +660,124 @@ test "v1.10.2 backward-compat: old QUEUE/SKIP/CLEAR still parse" {
     try std.testing.expect((try parseRequest(arena.allocator(), "QUEUE")) == .queue);
     try std.testing.expect((try parseRequest(arena.allocator(), "SKIP")) == .skip);
     try std.testing.expect((try parseRequest(arena.allocator(), "CLEAR")) == .clear);
+}
+
+// ---- v1.10.7 — per-call piper knobs (8-field wire) ----
+
+test "v1.10.7 parseRequest 8-field ENQUEUE with all 3 knobs set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t0\t1.05:0.8:1\tOlá warm Faber.",
+    );
+    try std.testing.expectEqual(Engine.piper, req.enqueue.engine);
+    try std.testing.expectEqual(Lang.pt, req.enqueue.lang);
+    try std.testing.expectEqualStrings("faber", req.enqueue.voice);
+    try std.testing.expectEqual(@as(u32, 330), req.enqueue.rate);
+    try std.testing.expectEqual(false, req.enqueue.ssml);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.05), req.enqueue.length_scale, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), req.enqueue.noise_scale, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), req.enqueue.noise_w, 0.0001);
+    try std.testing.expectEqualStrings("Olá warm Faber.", req.enqueue.text);
+}
+
+test "v1.10.7 parseRequest 8-field ENQUEUE with empty tune triplet means defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t0\t\tOlá",
+    );
+    try std.testing.expectEqual(@as(f32, 0.0), req.enqueue.length_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), req.enqueue.noise_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), req.enqueue.noise_w);
+    try std.testing.expectEqualStrings("Olá", req.enqueue.text);
+}
+
+test "v1.10.7 parseRequest 8-field ENQUEUE with only noise_w set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t0\t-:-:0.95\tOi.",
+    );
+    try std.testing.expectEqual(@as(f32, 0.0), req.enqueue.length_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), req.enqueue.noise_scale);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.95), req.enqueue.noise_w, 0.0001);
+}
+
+test "v1.10.7 encodeEnqueue round-trips per-call knobs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original: Message = .{
+        .engine = .piper,
+        .lang = .pt,
+        .voice = "faber",
+        .rate = 330,
+        .ssml = false,
+        .length_scale = 1.1,
+        .noise_scale = 0.7,
+        .noise_w = 1.0,
+        .text = "Teste warm.",
+    };
+    const wire = try encodeEnqueue(a, original);
+    const line = wire[0 .. wire.len - 1];
+    const req = try parseRequest(a, line);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.1), req.enqueue.length_scale, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), req.enqueue.noise_scale, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), req.enqueue.noise_w, 0.001);
+    try std.testing.expectEqualStrings("Teste warm.", req.enqueue.text);
+}
+
+test "v1.10.7 encodeEnqueue with all knobs unset emits empty tune slot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original: Message = .{
+        .engine = .piper,
+        .lang = .pt,
+        .voice = "faber",
+        .rate = 330,
+        .text = "Olá",
+    };
+    const wire = try encodeEnqueue(a, original);
+    // The triplet between ssml and text should be empty.
+    try std.testing.expect(std.mem.indexOf(u8, wire, "\t\t") != null);
+    const line = wire[0 .. wire.len - 1];
+    const req = try parseRequest(a, line);
+    try std.testing.expectEqual(@as(f32, 0.0), req.enqueue.length_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), req.enqueue.noise_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), req.enqueue.noise_w);
+}
+
+test "v1.10.7 parseTuneTriplet handles dashes and floats" {
+    const t1 = try parseTuneTriplet("1.05:0.8:1.0");
+    try std.testing.expectApproxEqAbs(@as(f32, 1.05), t1.length_scale, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), t1.noise_scale, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), t1.noise_w, 0.001);
+
+    const t2 = try parseTuneTriplet("-:-:-");
+    try std.testing.expectEqual(@as(f32, 0.0), t2.length_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), t2.noise_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), t2.noise_w);
+
+    const t3 = try parseTuneTriplet("");
+    try std.testing.expectEqual(@as(f32, 0.0), t3.length_scale);
+
+    try std.testing.expectError(error.Malformed, parseTuneTriplet("1.0:0.8"));
+    try std.testing.expectError(error.Malformed, parseTuneTriplet("abc:0.8:1.0"));
+}
+
+test "v1.10.7 backward-compat: v1.8 7-field still parses with knobs at sentinels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = try parseRequest(
+        arena.allocator(),
+        "ENQUEUE\tpiper\tpt\tfaber\t330\t0\tTexto sem tune.",
+    );
+    try std.testing.expectEqual(@as(f32, 0.0), req.enqueue.length_scale);
+    try std.testing.expectEqual(@as(f32, -1.0), req.enqueue.noise_scale);
+    try std.testing.expectEqualStrings("Texto sem tune.", req.enqueue.text);
 }

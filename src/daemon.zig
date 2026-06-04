@@ -54,6 +54,18 @@ const piper_mod = if (build_options.enabled) @import("piper.zig") else struct {
         ) Error![]i16 {
             return Error.CreateFailed;
         }
+        /// v1.10.7 — stub mirror of the per-call-knobs synth path.
+        pub fn synthLangTuned(
+            _: *@This(),
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: Route,
+            _: f32,
+            _: f32,
+            _: f32,
+        ) Error![]i16 {
+            return Error.CreateFailed;
+        }
         pub fn initMulti(
             _: std.mem.Allocator,
             _: []const u8,
@@ -588,7 +600,8 @@ fn runPiperSsml(
 
 // v0.7 fast path — one synth, one play, no thread spawn. v1.1: synth via
 // MultiPiperEngine.synthLang so single-chunk en-only items still route
-// through Amy when available.
+// through Amy when available. v1.10.7: route through synthLangTuned so
+// per-call knobs (length_scale / noise_scale / noise_w) ride along.
 fn runPiperSingle(
     res: *Resources,
     io: std.Io,
@@ -602,8 +615,23 @@ fn runPiperSingle(
         .en => .en,
         else => .pt,
     };
+    // v1.10.7 — log knobs when ANY override is set so A/B experiments
+    // surface in the daemon log. Quiet when all sentinels mean "default".
+    if (item.length_scale > 0 or item.noise_scale >= 0 or item.noise_w >= 0) {
+        std.debug.print(
+            "[worker] piper id={d} length_scale={d:.3} noise_scale={d:.3} noise_w={d:.3}\n",
+            .{ item.id, item.length_scale, item.noise_scale, item.noise_w },
+        );
+    }
     const t_synth0 = std.Io.Clock.now(.awake, io);
-    const samples = try engine.synthLang(sa, chunk.text, route);
+    const samples = try engine.synthLangTuned(
+        sa,
+        chunk.text,
+        route,
+        item.length_scale,
+        item.noise_scale,
+        item.noise_w,
+    );
     const t_synth1 = std.Io.Clock.now(.awake, io);
 
     const sample_rate = engine.sampleRate();
@@ -696,6 +724,12 @@ const SynthArgs = struct {
     chunks: []const preproc.Chunk,
     chan: *ChunkChannel,
     gpa: std.mem.Allocator,
+    /// v1.10.7 — per-call piper knobs forwarded from the popped queue
+    /// row. Sentinels (length_scale==0 / others < 0) preserve env + voice
+    /// defaults inside `synthToSamplesTuned`.
+    length_scale: f32 = 0.0,
+    noise_scale: f32 = -1.0,
+    noise_w: f32 = -1.0,
 };
 
 fn synthWorker(args: SynthArgs) void {
@@ -714,7 +748,14 @@ fn synthWorker(args: SynthArgs) void {
             .en => .en,
             else => .pt,
         };
-        const samples = args.engine.synthLang(arena_box.allocator(), chunk.text, route) catch {
+        const samples = args.engine.synthLangTuned(
+            arena_box.allocator(),
+            chunk.text,
+            route,
+            args.length_scale,
+            args.noise_scale,
+            args.noise_w,
+        ) catch {
             arena_box.deinit();
             args.gpa.destroy(arena_box);
             args.chan.push(.{ .synth_err = true });
@@ -753,11 +794,22 @@ fn runPiperStreaming(
     // synth thread and the worker thread don't contend on a debug GPA.
     const gpa = std.heap.smp_allocator;
 
+    // v1.10.7 — log knobs once before the streaming pipeline so the same
+    // diagnostic shows up regardless of single-chunk vs streaming path.
+    if (item.length_scale > 0 or item.noise_scale >= 0 or item.noise_w >= 0) {
+        std.debug.print(
+            "[worker] piper id={d} length_scale={d:.3} noise_scale={d:.3} noise_w={d:.3}\n",
+            .{ item.id, item.length_scale, item.noise_scale, item.noise_w },
+        );
+    }
     const args = SynthArgs{
         .engine = engine,
         .chunks = chunks,
         .chan = &chan,
         .gpa = gpa,
+        .length_scale = item.length_scale,
+        .noise_scale = item.noise_scale,
+        .noise_w = item.noise_w,
     };
     const synth_thread = try std.Thread.spawn(.{}, synthWorker, .{args});
 
