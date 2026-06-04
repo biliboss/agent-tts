@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const ipc = @import("ipc.zig");
+const postfx_mod = @import("postfx.zig");
 
 pub const DEFAULT_VOICE = "Luciana";
 pub const DEFAULT_RATE: u32 = 330;
@@ -58,12 +59,26 @@ const HELP =
     \\  --sentence-pause MS v1.10.8+: override `[[slnc N]]` after .!? (default 400).
     \\  --newline-pause MS  v1.10.8+: override `[[slnc N]]` after `\n` (default 600).
     \\  --speaker-id N      v1.10.8+: Piper multi-speaker index (-1 = voice default).
-    \\  --profile tech      v1.10.9: research-anchored Faber tech-narration —
-    \\                                --tech + length_scale=1.05 + noise_scale=0.35
-    \\                                + noise_w=0.45 + sentence_pause_ms=500.
-    \\                                Lower noise = stable but flatter; A/B
-    \\                                via voice_knob_search if you prefer
-    \\                                expressiveness.
+    \\  --profile P         v1.10.10: select a curated knob bundle.
+    \\                       tech         (default tech, was tight-narrator):
+    \\                                    --tech + length=1.05 + noise=0.35
+    \\                                    + noise_w=0.45 + sentence_pause=500ms.
+    \\                       stock-tech   (v1.10.8 defaults): length=0.95 +
+    \\                                    noise=0.667 + noise_w=0.85 + sent=500ms.
+    \\                       broadcast    --tech + length=1.10 + noise=0.55
+    \\                                    + noise_w=0.65 + sent=650 + comma=200.
+    \\                       expressive   --tech + length=1.00 + noise=0.85
+    \\                                    + noise_w=1.10 + sent=500 + comma=160.
+    \\  --postfx P          v1.10.10: ffmpeg post-processing chain applied to
+    \\                       the synth PCM before zaudio playback. Requires
+    \\                       ffmpeg on PATH (or AGENT_TTS_FFMPEG_PATH).
+    \\                       off          no-op (default).
+    \\                       clean        highpass 80 Hz + 2:1 compressor.
+    \\                       tech         RNNoise + 4-band EQ + de-esser + comp
+    \\                                    (RNNoise model from
+    \\                                    AGENT_TTS_POSTFX_RNNN_MODEL or
+    \\                                    ~/.cache/agent-tts/rnnoise/cb.rnnn).
+    \\                       broadcast    EQ + de-esser + 3:1 compressor.
     \\  -h, --help          this help
     \\  -V, --version       print version
     \\
@@ -103,6 +118,8 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
     var sentence_pause_ms: u32 = 0;
     var newline_pause_ms: u32 = 0;
     var speaker_id: i32 = -1;
+    // v1.10.10 — post-fx profile selector.
+    var postfx_profile: ipc.Postfx = .off;
     var text: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -237,30 +254,60 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
         } else if (std.mem.eql(u8, a, "--profile")) {
             i += 1;
             if (i >= args.len) {
-                std.debug.print("error: --profile needs value (tech)\n", .{});
+                std.debug.print("error: --profile needs value (tech|stock-tech|broadcast|expressive)\n", .{});
                 std.process.exit(2);
             }
             const profile = args[i];
+            // v1.10.10 — `tech` is now the locked-in tight-narrator
+            // bundle from v1.10.9's research. The legacy v1.10.8 numbers
+            // moved to `stock-tech` for callers who want them back. Two
+            // more curated bundles (`broadcast`, `expressive`) cover the
+            // remaining knob region without exposing every dial.
             if (std.mem.eql(u8, profile, "tech")) {
-                // v1.10.9 — research-anchored Faber tech-narration defaults
-                // sourced from `_qa/v1.10.9-research-prompt-output.md`:
-                // intelligibility-first on MCV-trained read-speech. Lower
-                // noise = stable but flatter prosody; the counter-argument
-                // is documented next to the help text. For more expressive
-                // output use `voice_knob_search` or `tech_profile_search`.
                 tech_flag = true;
                 if (length_scale == 0.0) length_scale = 1.05;
                 if (noise_scale < 0) noise_scale = 0.35;
                 if (noise_w < 0) noise_w = 0.45;
                 if (sentence_pause_ms == 0) sentence_pause_ms = 500;
+            } else if (std.mem.eql(u8, profile, "stock-tech")) {
+                tech_flag = true;
+                if (length_scale == 0.0) length_scale = 0.95;
+                if (noise_scale < 0) noise_scale = 0.667;
+                if (noise_w < 0) noise_w = 0.85;
+                if (sentence_pause_ms == 0) sentence_pause_ms = 500;
+            } else if (std.mem.eql(u8, profile, "broadcast")) {
+                tech_flag = true;
+                if (length_scale == 0.0) length_scale = 1.10;
+                if (noise_scale < 0) noise_scale = 0.55;
+                if (noise_w < 0) noise_w = 0.65;
+                if (sentence_pause_ms == 0) sentence_pause_ms = 650;
+                if (comma_pause_ms == 0) comma_pause_ms = 200;
+            } else if (std.mem.eql(u8, profile, "expressive")) {
+                tech_flag = true;
+                if (length_scale == 0.0) length_scale = 1.00;
+                if (noise_scale < 0) noise_scale = 0.85;
+                if (noise_w < 0) noise_w = 1.10;
+                if (sentence_pause_ms == 0) sentence_pause_ms = 500;
+                if (comma_pause_ms == 0) comma_pause_ms = 160;
             } else {
-                std.debug.print("error: --profile unknown (got '{s}'; expected: tech)\n", .{profile});
+                std.debug.print("error: --profile unknown (got '{s}'; expected: tech|stock-tech|broadcast|expressive)\n", .{profile});
                 std.process.exit(2);
             }
+        } else if (std.mem.eql(u8, a, "--postfx")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --postfx needs value (off|clean|tech|broadcast)\n", .{});
+                std.process.exit(2);
+            }
+            postfx_profile = ipc.Postfx.fromStr(args[i]) orelse {
+                std.debug.print("error: --postfx invalid (got '{s}') — expected off|clean|tech|broadcast\n", .{args[i]});
+                std.process.exit(2);
+            };
         } else {
             text = a;
         }
     }
+    _ = &postfx_mod; // anchor module import for build-time checks
 
     if (text == null) {
         std.debug.print(HELP, .{});
@@ -306,6 +353,7 @@ fn cmdEnqueue(arena: std.mem.Allocator, io: std.Io, home: []const u8, args: []co
         .sentence_pause_ms = sentence_pause_ms,
         .newline_pause_ms = newline_pause_ms,
         .speaker_id = speaker_id,
+        .postfx = postfx_profile,
         .text = clean,
     };
 
@@ -703,6 +751,49 @@ pub fn enqueueLineFull(
     newline_pause_ms: u32,
     speaker_id: i32,
 ) ![]u8 {
+    return enqueueLineWithPostfx(
+        arena,
+        io,
+        home,
+        engine,
+        voice,
+        rate,
+        text,
+        ssml_flag,
+        length_scale,
+        noise_scale,
+        noise_w,
+        tech,
+        comma_pause_ms,
+        sentence_pause_ms,
+        newline_pause_ms,
+        speaker_id,
+        .off,
+    );
+}
+
+/// v1.10.10 — enqueue with every per-call knob exposed plus the new
+/// `postfx` audio post-processing profile. Pass `.off` to keep the
+/// daemon's dry-PCM path.
+pub fn enqueueLineWithPostfx(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    engine: ipc.Engine,
+    voice: []const u8,
+    rate: u32,
+    text: []const u8,
+    ssml_flag: bool,
+    length_scale: f32,
+    noise_scale: f32,
+    noise_w: f32,
+    tech: bool,
+    comma_pause_ms: u32,
+    sentence_pause_ms: u32,
+    newline_pause_ms: u32,
+    speaker_id: i32,
+    postfx: ipc.Postfx,
+) ![]u8 {
     const clean = try ipc.sanitizeText(arena, text);
     const msg = ipc.Message{
         .engine = engine,
@@ -717,6 +808,7 @@ pub fn enqueueLineFull(
         .sentence_pause_ms = sentence_pause_ms,
         .newline_pause_ms = newline_pause_ms,
         .speaker_id = speaker_id,
+        .postfx = postfx,
         .text = clean,
     };
 

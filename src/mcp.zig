@@ -34,7 +34,7 @@ const ipc = @import("ipc.zig");
 const client = @import("client.zig");
 const preproc = @import("preproc.zig");
 
-pub const VERSION = "1.10.9";
+pub const VERSION = "1.10.10";
 pub const PROTOCOL_VERSION = "2024-11-05";
 
 const READ_BUF = 256 * 1024; // long agent monologues hit ~8 KB after escaping
@@ -223,8 +223,8 @@ fn buildToolsListResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
         try toolDescriptor(a, "synth_voice_test", "Enqueue a one-shot piper synth with explicit length_scale / noise_scale / noise_w (v1.10.8: + tech / pause overrides / speaker_id). Returns the enqueue id plus the resolved knobs so an agent can A/B Faber profiles without daemon restart.", try synthVoiceTestSchema(a)),
         // v1.10.8 — automate the discovery loop: one call, N variants enqueued.
         try toolDescriptor(a, "voice_knob_search", "Enqueue the same text once per `variants` entry, each with its own knob bundle (length_scale / noise_scale / noise_w / tech / *_pause_ms / speaker_id). Returns the list of `{id, knobs}` so the caller can compare A/B/.../N profiles in a single MCP round-trip. max_variants capped at 16.", try voiceKnobSearchSchema(a)),
-        // v1.10.9 — curated 4-variant preset matrix for tech-narration discovery.
-        try toolDescriptor(a, "tech_profile_search", "v1.10.9: enqueue a curated 4-variant tech-narration matrix (tight-narrator, stock-tech, broadcast, expressive). Each variant runs through Faber piper with tech=true. Subset of the Resolution IV 2⁴⁻¹ in `_qa/v1.10.9-research-prompt-output.md`. Returns 4 `{id, name, knobs}` so the caller can ask the user to pick.", try techProfileSearchSchema(a)),
+        // v1.10.9 / v1.10.10 — curated 4-variant × 2-postfx matrix.
+        try toolDescriptor(a, "tech_profile_search", "v1.10.10: enqueue a curated 4×2=8 tech-narration matrix — each of the 4 knob bundles (tight-narrator/stock-tech/broadcast/expressive) is enqueued twice: once dry (postfx=off) and once with the research-anchored RNNoise+EQ+deesser+comp chain (postfx=tech). Each variant runs through Faber piper with tech=true. Returns 8 `{id, name, postfx, knobs}` so the caller can A/B both knob AND post-fx in one round-trip.", try techProfileSearchSchema(a)),
     });
     const result = try obj(a, &.{
         .{ "tools", tools },
@@ -307,6 +307,13 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
         .{ "type", str("integer") },
         .{ "description", str("v1.10.8+: Piper multi-speaker integer index. -1 = use voice config default. Faber is single-speaker (ignored).") },
     });
+    // v1.10.10 — ffmpeg post-fx selector.
+    const postfx_enum = try arr(a, &.{ str("off"), str("clean"), str("tech"), str("broadcast") });
+    const postfx_prop = try obj(a, &.{
+        .{ "type", str("string") },
+        .{ "enum", postfx_enum },
+        .{ "description", str("v1.10.10+: audio post-processing profile applied to the synth PCM before zaudio playback. `off` (default) is the dry path. `clean` is highpass+light comp. `tech` is the research-anchored chain (RNNoise+EQ+deesser+2:1 comp) — needs ffmpeg on PATH and an RNNoise model at AGENT_TTS_POSTFX_RNNN_MODEL or ~/.cache/agent-tts/rnnoise/cb.rnnn. `broadcast` is EQ+deesser+3:1 comp. Pass-through when ffmpeg is missing.") },
+    });
 
     const props = try obj(a, &.{
         .{ "text", text_prop },
@@ -322,6 +329,7 @@ fn saySchema(a: std.mem.Allocator) !json.Value {
         .{ "sentence_pause_ms", sentence_pause_prop },
         .{ "newline_pause_ms", newline_pause_prop },
         .{ "speaker_id", speaker_id_prop },
+        .{ "postfx", postfx_prop },
     });
     const required = try arr(a, &.{str("text")});
 
@@ -356,6 +364,13 @@ fn synthVoiceTestSchema(a: std.mem.Allocator) !json.Value {
     const sentence_pause_prop = try obj(a, &.{ .{ "type", str("integer") }, .{ "description", str("v1.10.8+: sentence pause override (ms).") } });
     const newline_pause_prop = try obj(a, &.{ .{ "type", str("integer") }, .{ "description", str("v1.10.8+: newline pause override (ms).") } });
     const speaker_id_prop = try obj(a, &.{ .{ "type", str("integer") }, .{ "description", str("v1.10.8+: Piper speaker index (-1 = default).") } });
+    // v1.10.10 — postfx selector mirrored from saySchema.
+    const postfx_enum = try arr(a, &.{ str("off"), str("clean"), str("tech"), str("broadcast") });
+    const postfx_prop = try obj(a, &.{
+        .{ "type", str("string") },
+        .{ "enum", postfx_enum },
+        .{ "description", str("v1.10.10+: ffmpeg post-fx chain. off (default) / clean / tech / broadcast.") },
+    });
     const props = try obj(a, &.{
         .{ "text", text_prop },
         .{ "length_scale", length_scale_prop },
@@ -366,6 +381,7 @@ fn synthVoiceTestSchema(a: std.mem.Allocator) !json.Value {
         .{ "sentence_pause_ms", sentence_pause_prop },
         .{ "newline_pause_ms", newline_pause_prop },
         .{ "speaker_id", speaker_id_prop },
+        .{ "postfx", postfx_prop },
     });
     const required = try arr(a, &.{str("text")});
     return try obj(a, &.{
@@ -755,8 +771,14 @@ fn callSay(
         if (v.integer < -1 or v.integer > 1000) return try toolErrorResponse(a, id, "speaker_id out of range (-1..1000)");
         speaker_id = @intCast(v.integer);
     }
+    // v1.10.10 — postfx selector.
+    var postfx_profile: ipc.Postfx = .off;
+    if (ao.get("postfx")) |v| {
+        if (v != .string) return try toolErrorResponse(a, id, "postfx must be a string");
+        postfx_profile = ipc.Postfx.fromStr(v.string) orelse return try toolErrorResponse(a, id, "postfx must be off|clean|tech|broadcast");
+    }
 
-    const id_str = client.enqueueLineFull(
+    const id_str = client.enqueueLineWithPostfx(
         a,
         io,
         home,
@@ -773,6 +795,7 @@ fn callSay(
         sentence_pause_ms,
         newline_pause_ms,
         speaker_id,
+        postfx_profile,
     ) catch |e| switch (e) {
         error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running — start with `agent-tts daemon` or `agent-tts daemon install`"),
         error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error"),
@@ -901,8 +924,13 @@ fn callSynthVoiceTest(
         if (v.integer < -1 or v.integer > 1000) return try toolErrorResponse(a, id, "speaker_id out of range (-1..1000)");
         speaker_id = @intCast(v.integer);
     }
+    var postfx_profile: ipc.Postfx = .off;
+    if (ao.get("postfx")) |v| {
+        if (v != .string) return try toolErrorResponse(a, id, "postfx must be a string");
+        postfx_profile = ipc.Postfx.fromStr(v.string) orelse return try toolErrorResponse(a, id, "postfx must be off|clean|tech|broadcast");
+    }
 
-    const id_str = client.enqueueLineFull(
+    const id_str = client.enqueueLineWithPostfx(
         a,
         io,
         home,
@@ -919,6 +947,7 @@ fn callSynthVoiceTest(
         sentence_pause_ms,
         newline_pause_ms,
         speaker_id,
+        postfx_profile,
     ) catch |e| switch (e) {
         error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
         error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error"),
@@ -937,6 +966,7 @@ fn callSynthVoiceTest(
         .{ "sentence_pause_ms", int(@intCast(sentence_pause_ms)) },
         .{ "newline_pause_ms", int(@intCast(newline_pause_ms)) },
         .{ "speaker_id", int(@intCast(speaker_id)) },
+        .{ "postfx", str(postfx_profile.str()) },
     });
     const text_block = try formatJsonAsText(a, payload);
     return try toolTextResponse(a, id, text_block);
@@ -1146,51 +1176,67 @@ fn callTechProfileSearch(
     if (text_val != .string) return try toolErrorResponse(a, id, "text must be a string");
     const text = text_val.string;
 
+    // v1.10.10 — 4 knob bundles × 2 postfx variants = 8 enqueues per
+    // call. Cap is 16 (matches voice_knob_search budget). Each entry
+    // tags the resolved postfx so the caller can match audible result
+    // to id without recomputing the matrix.
+    const POSTFX_VARIANTS = [_]ipc.Postfx{ .off, .tech };
+    const total: usize = TECH_PROFILES.len * POSTFX_VARIANTS.len;
+    if (total > 16) return try toolErrorResponse(a, id, "tech_profile_search matrix exceeds 16 cap");
+
     var items: json.Array = .init(a);
     for (TECH_PROFILES) |p| {
-        const id_str = client.enqueueLineFull(
-            a,
-            io,
-            home,
-            .piper,
-            "faber",
-            client.DEFAULT_RATE,
-            text,
-            false, // ssml
-            p.length_scale,
-            p.noise_scale,
-            p.noise_w,
-            true, // tech
-            p.comma_pause_ms,
-            p.sentence_pause_ms,
-            0, // newline_pause_ms (default)
-            -1, // speaker_id
-        ) catch |e| switch (e) {
-            error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
-            error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error mid-search"),
-            error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon returned an unexpected response mid-search"),
-            else => return e,
-        };
+        for (POSTFX_VARIANTS) |pfx| {
+            const id_str = client.enqueueLineWithPostfx(
+                a,
+                io,
+                home,
+                .piper,
+                "faber",
+                client.DEFAULT_RATE,
+                text,
+                false, // ssml
+                p.length_scale,
+                p.noise_scale,
+                p.noise_w,
+                true, // tech
+                p.comma_pause_ms,
+                p.sentence_pause_ms,
+                0, // newline_pause_ms (default)
+                -1, // speaker_id
+                pfx,
+            ) catch |e| switch (e) {
+                error.DaemonUnreachable => return try toolErrorResponse(a, id, "daemon not running"),
+                error.DaemonError => return try toolErrorResponse(a, id, "daemon returned an error mid-search"),
+                error.UnexpectedResponse => return try toolErrorResponse(a, id, "daemon returned an unexpected response mid-search"),
+                else => return e,
+            };
 
-        const knobs = try obj(a, &.{
-            .{ "length_scale", json.Value{ .float = @floatCast(p.length_scale) } },
-            .{ "noise_scale", json.Value{ .float = @floatCast(p.noise_scale) } },
-            .{ "noise_w", json.Value{ .float = @floatCast(p.noise_w) } },
-            .{ "tech", boolean(true) },
-            .{ "comma_pause_ms", int(@intCast(p.comma_pause_ms)) },
-            .{ "sentence_pause_ms", int(@intCast(p.sentence_pause_ms)) },
-        });
-        const entry = try obj(a, &.{
-            .{ "id", str(id_str) },
-            .{ "name", str(p.name) },
-            .{ "knobs", knobs },
-        });
-        try items.append(entry);
+            const knobs = try obj(a, &.{
+                .{ "length_scale", json.Value{ .float = @floatCast(p.length_scale) } },
+                .{ "noise_scale", json.Value{ .float = @floatCast(p.noise_scale) } },
+                .{ "noise_w", json.Value{ .float = @floatCast(p.noise_w) } },
+                .{ "tech", boolean(true) },
+                .{ "comma_pause_ms", int(@intCast(p.comma_pause_ms)) },
+                .{ "sentence_pause_ms", int(@intCast(p.sentence_pause_ms)) },
+            });
+            // Comment makes the (name, postfx) pair searchable in
+            // history dumps. Mirrors the voice_knob_search shape.
+            const comment = try std.fmt.allocPrint(a, "{s} + postfx={s}", .{ p.name, pfx.str() });
+            const entry = try obj(a, &.{
+                .{ "id", str(id_str) },
+                .{ "name", str(p.name) },
+                .{ "postfx", str(pfx.str()) },
+                .{ "comment", str(comment) },
+                .{ "knobs", knobs },
+            });
+            try items.append(entry);
+        }
     }
 
     const payload = try obj(a, &.{
         .{ "items", json.Value{ .array = items } },
-        .{ "count", int(@intCast(TECH_PROFILES.len)) },
+        .{ "count", int(@intCast(total)) },
     });
     const text_block = try formatJsonAsText(a, payload);
     return try toolTextResponse(a, id, text_block);
@@ -1512,6 +1558,29 @@ test "v1.10.8 say schema exposes tech + pause overrides + speaker_id" {
     try std.testing.expect(props.get("sentence_pause_ms") != null);
     try std.testing.expect(props.get("newline_pause_ms") != null);
     try std.testing.expect(props.get("speaker_id") != null);
+}
+
+test "v1.10.10 say schema exposes postfx with the 4-value enum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try saySchema(a);
+    const props = schema.object.get("properties").?.object;
+    const postfx = props.get("postfx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("string", postfx.object.get("type").?.string);
+    const enum_arr = postfx.object.get("enum").?.array;
+    try std.testing.expectEqual(@as(usize, 4), enum_arr.items.len);
+    try std.testing.expectEqualStrings("off", enum_arr.items[0].string);
+    try std.testing.expectEqualStrings("tech", enum_arr.items[2].string);
+}
+
+test "v1.10.10 synth_voice_test schema exposes postfx" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try synthVoiceTestSchema(a);
+    const props = schema.object.get("properties").?.object;
+    try std.testing.expect(props.get("postfx") != null);
 }
 
 test "v1.10.8 voice_knob_search schema requires text + variants" {

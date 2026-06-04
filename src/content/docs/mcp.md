@@ -5,7 +5,7 @@ description: Native Claude Code / Cursor / Cline voice — agent-tts speaks via 
 
 ## TL;DR
 
-`agent-tts mcp` runs a stdio JSON-RPC 2.0 server that exposes the daemon to any [Model Context Protocol](https://modelcontextprotocol.io) client. Claude Code, Cursor, Cline, Continue — same wire, same **13 tools** (v1.10.9). No shell-out, no permission prompt per call, no stdout parsing.
+`agent-tts mcp` runs a stdio JSON-RPC 2.0 server that exposes the daemon to any [Model Context Protocol](https://modelcontextprotocol.io) client. Claude Code, Cursor, Cline, Continue — same wire, same **13 tools** (v1.10.10 adds the `postfx` enum param to `say` / `synth_voice_test` and doubles `tech_profile_search` to a 4×2=8 knob×postfx matrix). No shell-out, no permission prompt per call, no stdout parsing.
 
 Bundled in the same Zig binary as the CLI and the daemon. `+115 KB` over v1.0. Tools only — `prompts/`, `resources/`, `sampling/` are deferred.
 
@@ -44,7 +44,7 @@ You should get back a single JSON line listing the 13 tools.
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `say` | `{ text, engine?, voice?, rate?, ssml?, length_scale?, noise_scale?, noise_w?, tech?, comma_pause_ms?, sentence_pause_ms?, newline_pause_ms?, speaker_id? }` | `{ id }` |
+| `say` | `{ text, engine?, voice?, rate?, ssml?, length_scale?, noise_scale?, noise_w?, tech?, comma_pause_ms?, sentence_pause_ms?, newline_pause_ms?, speaker_id?, postfx? }` | `{ id }` |
 | `queue` | `{}` | `{ items: [...] }` |
 | `skip` | `{ id? }` (ignored in v1.5) | `{ skipped_id }` |
 | `clear` | `{}` | `{ cleared_count }` |
@@ -54,9 +54,15 @@ You should get back a single JSON line listing the 13 tools.
 | `resume` (v1.10.2+) | `{}` | `{ resumed_id }` (0 = not paused) |
 | `replay` (v1.10.2+) | `{ id }` | `{ new_id }` (0 = item not found) |
 | `history` (v1.10.2+) | `{ limit? }` (1..100, default 20) | `{ items: [{id,state,engine,voice,rate,finished_at,text}, ...] }` |
-| `synth_voice_test` (v1.10.7+) | `{ text, length_scale?, noise_scale?, noise_w?, tech?, *_pause_ms?, speaker_id? }` | `{ id, …resolved knobs… }` |
+| `synth_voice_test` (v1.10.7+) | `{ text, length_scale?, noise_scale?, noise_w?, tech?, *_pause_ms?, speaker_id?, postfx? }` | `{ id, …resolved knobs…, postfx }` |
 | `voice_knob_search` (v1.10.8+) | `{ text, variants: [{...knobs, comment?}], max_variants? }` | `{ items: [{id, comment, knobs}], truncated }` |
-| `tech_profile_search` (v1.10.9+) | `{ text }` | `{ items: [{id, name, knobs}], count: 4 }` — fixed 4-variant matrix (tight-narrator / stock-tech / broadcast / expressive). Curated subset of the Resolution IV 2⁴⁻¹ from the research note |
+| `tech_profile_search` (v1.10.10+) | `{ text }` | `{ items: [{id, name, postfx, comment, knobs}], count: 8 }` — fixed 4×2 matrix (tight-narrator / stock-tech / broadcast / expressive) × (postfx=off / postfx=tech) so the caller A/Bs both knob AND post-fx in one round-trip |
+
+### v1.10.10 — `postfx` on `say` and `synth_voice_test`
+
+Both tools accept an optional `postfx` enum routing the synth PCM through an ffmpeg subprocess (RNNoise + 4-band EQ + de-esser + 2:1 compressor) before zaudio plays it. Values: `off` (default) / `clean` / `tech` / `broadcast`. See [motor → Audio post-processing](/agent-tts/motor/#audio-post-processing-v11010) for the exact filter graphs and the `brew install ffmpeg` + RNNoise model install. ffmpeg must be on `PATH` (or at `$AGENT_TTS_FFMPEG_PATH`); when missing the chain falls back to dry PCM silently.
+
+`tech_profile_search` now enqueues each of its 4 curated knob bundles twice — once dry, once with `postfx=tech` — so a single MCP call gives Claude Code 8 IDs covering the full (knob × postfx) hyperplane.
 
 ### v1.10.7 — Per-call Piper knobs on `say`
 
