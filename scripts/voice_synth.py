@@ -80,14 +80,20 @@ def main() -> int:
         speaker_embedding = torch.from_numpy(data["speaker_embedding"]).to(args.device)
 
     print(f"[voice_synth] synth lang={args.lang} chars={len(text)}", file=sys.stderr)
+    # v1.10.6 tuning: lower temperature + repetition_penalty + top_k/top_p
+    # for faithfulness-to-sample. Defaults inspired by Coqui's "max-fidelity"
+    # config used in the public demo. Each is env-overridable for A/B work.
     out = inner.inference(
         text=text,
         language=args.lang,
         gpt_cond_latent=gpt_cond_latent,
         speaker_embedding=speaker_embedding,
-        # Reasonable defaults — match Coqui's standard demo. Tune via env
-        # AGENT_TTS_TEMPERATURE if needed.
-        temperature=float(os.environ.get("AGENT_TTS_TEMPERATURE", "0.7")),
+        temperature=float(os.environ.get("AGENT_TTS_TEMPERATURE", "0.65")),
+        length_penalty=float(os.environ.get("AGENT_TTS_LENGTH_PENALTY", "1.0")),
+        repetition_penalty=float(os.environ.get("AGENT_TTS_REPETITION_PENALTY", "10.0")),
+        top_k=int(os.environ.get("AGENT_TTS_TOP_K", "50")),
+        top_p=float(os.environ.get("AGENT_TTS_TOP_P", "0.85")),
+        enable_text_splitting=True,
     )
 
     # `out["wav"]` is float32 in [-1, 1] at the model's native rate (24000Hz

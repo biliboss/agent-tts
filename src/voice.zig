@@ -181,8 +181,9 @@ pub fn cmdClone(
     // The script handles its own dependency resolution. In --quiet mode the
     // sidecar's stdout is sunk to /dev/null but stderr stays attached so the
     // parent UI can still surface real errors.
+    const script_path = resolveScriptPath(arena, "voice_clone.py") catch "scripts/voice_clone.py";
     try invokeSidecar(arena, io, home, &.{
-        "scripts/voice_clone.py",
+        script_path,
         "--sample",
         sample_path.?,
         "--out",
@@ -531,18 +532,63 @@ fn buildArgv(arena: std.mem.Allocator, script_args: []const []const u8) ![][]con
     return argv;
 }
 
-/// Returns the venv python path if `.venv-voice/bin/python` exists in cwd,
-/// `null` otherwise. We do this with `std.c.access` (cheaper than openat +
-/// close and we don't need a handle). The returned slice points at static
-/// storage — safe because we copy via std.mem.copyForwards in the caller.
+/// v1.10.6: resolve script + venv via absolute install paths so the CLI
+/// works from any cwd. Probe order: $AGENT_TTS_REPO_ROOT → /opt/homebrew/share/agent-tts
+/// → /usr/local/share/agent-tts → cwd-relative.
+fn installRoots(arena: std.mem.Allocator) []const []const u8 {
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    var roots: std.ArrayList([]const u8) = .empty;
+    const env_root = c.getenv("AGENT_TTS_REPO_ROOT");
+    if (env_root != null) {
+        const s = std.mem.span(env_root);
+        if (s.len > 0) roots.append(arena, s) catch {};
+    }
+    roots.append(arena, "/opt/homebrew/share/agent-tts") catch {};
+    roots.append(arena, "/usr/local/share/agent-tts") catch {};
+    return roots.toOwnedSlice(arena) catch &.{};
+}
+
+fn fileExistsAbs(path: []const u8) bool {
+    const buf = std.heap.smp_allocator.dupeZ(u8, path) catch return false;
+    defer std.heap.smp_allocator.free(buf);
+    return std.c.access(buf.ptr, std.c.F_OK) == 0;
+}
+
+fn resolveScriptPath(arena: std.mem.Allocator, leaf: []const u8) ![]const u8 {
+    for (installRoots(arena)) |root| {
+        const abs = try std.fmt.allocPrint(arena, "{s}/scripts/{s}", .{ root, leaf });
+        if (fileExistsAbs(abs)) return abs;
+    }
+    return try std.fmt.allocPrint(arena, "scripts/{s}", .{leaf});
+}
+
+/// Returns the venv python path. v1.10.6: probes absolute install roots first
+/// so daemon-spawned / cwd-elsewhere callers find it. Falls back to cwd-relative
+/// `.venv-voice/bin/python`.
 fn venvPythonExists() ?[]const u8 {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (installRoots(arena)) |root| {
+        const abs = std.fmt.allocPrint(arena, "{s}/.venv-voice/bin/python", .{root}) catch continue;
+        if (fileExistsAbs(abs)) {
+            // Copy out of arena into static storage so caller's lifetime is OK.
+            const len = @min(abs.len, venv_buf.len - 1);
+            @memcpy(venv_buf[0..len], abs[0..len]);
+            venv_buf[len] = 0;
+            return venv_buf[0..len];
+        }
+    }
+    // Legacy cwd-relative fallback.
     const path = ".venv-voice/bin/python";
     const z = std.fmt.bufPrintZ(@constCast(&venv_buf), "{s}", .{path}) catch return null;
     if (std.c.access(z.ptr, std.c.F_OK) == 0) return path;
     return null;
 }
 
-var venv_buf: [64]u8 = undefined;
+var venv_buf: [256]u8 = undefined;
 
 fn lookPath(name: []const u8) bool {
     // Tiny PATH walk — enough for "is uv on PATH?". We do not need full

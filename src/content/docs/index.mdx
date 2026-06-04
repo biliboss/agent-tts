@@ -1,18 +1,18 @@
 ---
 title: agent-tts
-description: Give your AI agents a voice. Zig CLI for Pt-BR neural TTS on macOS — fast cold start, persistent queue, one binary.
+description: Native voice channel for AI agents. Zig single-binary CLI + daemon + MCP server + menubar app. Neural Pt-BR + voice cloning + streaming, all offline.
 template: splash
 hero:
   image:
     file: ../../../public/logos/agent-tts-logo.png
-  tagline: "Give your AI agents a voice. Neural Pt-BR TTS on macOS, one Zig binary, ~90ms warm synth."
+  tagline: "Native voice channel for your AI agents. Zig single binary — Claude Code, Cursor, Cline talk through it. Neural Pt-BR by default. Clone your own voice. Offline, ~90 ms warm synth, $0 per message."
   actions:
     - text: Install
       link: https://github.com/biliboss/agent-tts#install
       icon: rocket
       variant: primary
-    - text: Architecture
-      link: /agent-tts/arquitetura/
+    - text: Try the playground
+      link: /agent-tts/playground/
       icon: right-arrow
       variant: secondary
     - text: GitHub
@@ -25,23 +25,33 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 
 ## Why agent-tts
 
-Your agents already write, build, deploy, and review. They should also **talk** — without stealing focus, without a Python venv, without paying ElevenLabs per token.
+Your AI agents already write, build, deploy, and review. They should also **talk** — without stealing focus, without a Python venv, without paying ElevenLabs per token, without a shell-out from every tool.
 
 ```bash
+# CLI
 agent-tts "Build green in 12 seconds."
-agent-tts --engine piper "Deploy concluído, três warnings."
-agent-tts queue       # list what is pending
-agent-tts skip        # kill current
+agent-tts --voice gabriel "Deploy concluído."   # cloned voice
+agent-tts history --limit 10                    # persistent timeline
+agent-tts pause; agent-tts resume; agent-tts replay 42
+
+# MCP (Claude Code, Cursor, Cline)
+claude mcp add agent-tts /opt/homebrew/bin/agent-tts mcp
+# Tools: say / queue / skip / clear / voices / say_stream / pause / resume / replay / history
 ```
 
 | | agent-tts | macOS `say` | Piper (Python) | ElevenLabs |
 |---|---|---|---|---|
-| Warm synth latency | **~91ms** | n/a | 200-300ms | 200-800ms + network |
-| Cold daemon boot | **~720ms** | 0 per call | 1-3s | 0 |
-| Persistent queue | ✅ SQLite WAL | ❌ | ❌ | ❌ |
-| Skip / clear / list | ✅ | ❌ | ❌ | n/a |
-| Auto-start | ✅ launchd | n/a | manual | n/a |
-| Single binary | ✅ ~975 KB | n/a | ❌ Python venv | ❌ |
+| Warm synth latency | **~91 ms** | n/a | 200–300 ms | 200–800 ms + network |
+| Long-input first audio | **~50 ms** (v1.2 streaming) | n/a | full-input wait | full-input wait |
+| MCP tool-call (Claude Code) | **~1–3 ms warm** | shell-out + permission | shell-out | network |
+| Persistent queue + history | ✅ SQLite WAL | ❌ | ❌ | ❌ |
+| Pause / resume / replay | ✅ (v1.10.2+) | ❌ | ❌ | ❌ |
+| Voice cloning | ✅ XTTS-v2 sidecar (v1.4+) | ❌ | bring-your-own | ✅ (paid) |
+| SSML prosody | ✅ subset (v1.8+) | ✅ `[[ ]]` only | ❌ | ✅ |
+| Streaming text input | ✅ (v1.7+) | ❌ | manual | ✅ |
+| Menubar app | ✅ SwiftUI (v1.10+) | ❌ | ❌ | ❌ |
+| MCP server bundled | ✅ stdio JSON-RPC | ❌ | ❌ | ❌ |
+| Single binary | ✅ ~1 MB | n/a | ❌ Python venv | ❌ |
 | Offline | ✅ | ✅ | ✅ | ❌ |
 | Cost per message | $0 | $0 | $0 | $$$ |
 
@@ -51,34 +61,49 @@ Everything is benchmarked against the gap between calling `agent-tts "text"` and
 
 | Scenario | Target | Measured |
 |---|---|---|
-| Warm daemon, voice loaded | **< 300ms** | round-trip 0.1ms + synth 91ms |
-| First call after boot (cold) | < 800ms | pre-warm 280ms + zaudio 79ms + piper 373ms |
-| Long text — first chunk | < 400ms | (v1.1) |
+| Warm CLI ack round-trip | < 5 ms | **0.2–0.4 ms** |
+| Warm daemon piper synth (short) | < 300 ms | **~91 ms** |
+| Long-input first audio (streaming, v1.2) | < 200 ms | **~50 ms** |
+| MCP warm tool-call (persistent process) | < 10 ms | **~1–3 ms** |
+| First call after boot (cold) | < 800 ms | pre-warm 280 ms + zaudio 79 ms + piper 373 ms = ~720 ms |
+
+## Built for AI agents
 
 <CardGrid>
-  <Card title="Architecture" icon="setting">
-    Zig 0.16 + daemon + UNIX socket + SQLite WAL + zaudio. Single binary, two modes. [Read →](/arquitetura/)
+  <Card title="MCP server bundled" icon="puzzle">
+    `agent-tts mcp` — stdio JSON-RPC. 10 tools: `say`, `queue`, `skip`, `clear`, `voices`, `say_stream`, `pause`, `resume`, `replay`, `history`. Drop-in for Claude Code / Cursor / Cline. [Read →](/mcp/)
   </Card>
-  <Card title="TTS engine" icon="approve-check-circle">
-    Piper Faber by default for neural quality, macOS `say` as offline fallback. [Read →](/motor/)
+  <Card title="Streaming input" icon="open-book">
+    `agent-tts stream` reads stdin and emits sentences as terminators arrive. MCP `say_stream(stream_id, chunk, final?)` matches the LLM delta shape. Hear the agent before it finishes thinking.
   </Card>
-  <Card title="Roadmap" icon="rocket">
-    v0.1 → v1.0 shipped in one day. v1.1+ adds multilingual + Linux. [Read →](/roadmap/)
+  <Card title="Voice cloning" icon="rocket">
+    Record 30–90 seconds via the menubar window with a guided Pt-BR script. XTTS-v2 sidecar produces an `embedding.npz`. Use it from any client via `--voice <slug>`.
+  </Card>
+  <Card title="History + pause/resume/replay" icon="approve-check-circle">
+    SQLite WAL keeps every utterance. Pause mid-playback, resume from the same cursor, replay any past item by id. CLI + MCP + menubar all hit the same ops.
+  </Card>
+  <Card title="Menubar floating player" icon="laptop">
+    macOS NSStatusItem + floating NSPanel. Skip / Replay / voice picker — without opening a terminal. [Read →](/menubar/)
+  </Card>
+  <Card title="SSML & prosody" icon="document">
+    W3C SSML 1.1 subset: `<emphasis>`, `<break>`, `<prosody>`, `<say-as>`. Parse < 0.2 µs / 280 chars. Works on `say` and on Piper (length-scale + silence). [Read →](/motor/)
   </Card>
 </CardGrid>
 
-## Designed for AI agents
-
-- **Stable line protocol** over UNIX socket — easy to wrap from any language
-- **Sub-millisecond round-trip ACK** — the agent moves on while the voice plays
-- **Crash-safe queue** in SQLite WAL — texts survive a daemon restart
-- **No paywall, no quota** — runs entirely on your Mac
-
 ## Locked constraints
 
-- **Platform**: Apple Silicon macOS in v1.0 (Linux v1.1+)
-- **Footprint**: single ~975 KB binary, no embedded voice model
-- **Single binary**: CLI and daemon share the executable
-- **Pt-BR human cadence**: cardinals, abbreviations, and punctuation pauses preprocessed
+- **Platform**: macOS Apple Silicon + Intel universal binary. Linux code paths compile on `ubuntu-latest` CI (espeak-ng + systemd); v1.3 ships structurally, runtime testing in flight.
+- **Footprint**: single ~1 MB binary (`zig build`). Piper voice ONNX (~63 MB) and XTTS-v2 (~1.8 GB) are opt-in downloads to `~/.cache/agent-tts/`.
+- **Architecture**: CLI + daemon + MCP + menubar all share the binary or the same UNIX socket protocol.
+- **Pt-BR human cadence**: cardinals, abbreviations, and punctuation pauses preprocessed in 2–5 µs.
+- **Offline by default**: no cloud, no telemetry, no quota. Voice models cached locally.
 
-> Living document. Every decision is re-evaluated if measured TTFA drifts off target. PRs welcome at [biliboss/agent-tts](https://github.com/biliboss/agent-tts).
+## License
+
+Dual **MIT OR Apache-2.0** for the agent-tts source. **GPL-3.0-or-later** inherits when you build with `-Dwith-piper=true` (libpiper is GPL). The XTTS sidecar runs out-of-process so MPL-2.0 (Coqui TTS) stays at the process line.
+
+## Stay in sync
+
+Living project. Eighteen base + six patch milestones already shipped — see the [Roadmap](/roadmap/) and [Changelog](/changelog/) for the full timeline. The current state of every feature lives in [Architecture](/arquitetura/), [TTS engine](/motor/), [MCP server](/mcp/), [Menubar UI](/menubar/), and [Playground](/playground/).
+
+> PRs welcome at [biliboss/agent-tts](https://github.com/biliboss/agent-tts). Vote with stars + issues tagged `roadmap` to push priority.

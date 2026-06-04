@@ -32,7 +32,13 @@ Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss
 | **v1.7** | Streaming text input: `agent-tts stream` + `say_stream` MCP tool + incremental chunker | 166/166 tests, end-to-end CLI + MCP green, latency bench wired | 2026-06-03 |
 | **v1.8** | SSML 1.1 subset: `<emphasis>` / `<break>` / `<prosody>` / `<say-as>` for `say` + Piper | parse < 0.2 µs / 280 chars, +16 ssml tests + 5 ipc tests | 2026-06-03 |
 | **v1.9** | Web playground scaffold: Astro widget + voice picker + Speak button + 501 stub | scaffold only — WASM Piper synth deferred to v1.9.1 | 2026-06-03 |
-| **v1.10** | Menubar UI: SwiftUI status item + queue + Skip/Clear + voice picker | 911 Swift LOC, 321 KB .app binary; ducking + Linux GTK deferred to v1.10.1 | 2026-06-03 |
+| **v1.10** | Menubar UI: SwiftUI status item + queue + Skip/Clear + voice picker | 911 Swift LOC, 321 KB .app binary | 2026-06-03 |
+| **v1.10.1** | Playground externalize JS/CSS + menubar AppIcon.icns + live screenshot | external `public/playground/widget.{js,css}`; sips+iconutil pipeline | 2026-06-03 |
+| **v1.10.2** | History + pause/resume/replay + floating SwiftUI player + 4 new MCP tools | 17/17 socket-parser cases; 10 MCP tools total | 2026-06-03 |
+| **v1.10.3** | Guided voice clone UI (record + reading script + auto-clone) | 440 LOC clone window + 170 LOC AVAudioRecorder wrapper; `--quiet` machine contract | 2026-06-03 |
+| **v1.10.4** | Clone diagnostic: WAV size log + Show WAV in Finder | binary + bundle bumped; cancel-row affordance | 2026-06-03 |
+| **v1.10.5** | Daemon + CLI resolve sidecar via absolute path | `$AGENT_TTS_REPO_ROOT` → `/opt/homebrew/share/agent-tts` probe; voice routing finally correct from launchd cwd | 2026-06-03 |
+| **v1.10.6** | XTTS quality knobs (temp/top_k/top_p/repetition_penalty) + longer reference window | re-clone bogdo → live playback validated; `AGENT_TTS_*` env overrides for A/B | 2026-06-04 |
 
 ## KPI delivered
 

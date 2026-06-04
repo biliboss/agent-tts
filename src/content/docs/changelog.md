@@ -9,6 +9,50 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10.6 — XTTS quality tuning · 2026-06-04
+
+**Why a patch:** v1.10.5 made the daemon find `voice_synth.py`, but the first cloned voice still sounded generic. Coqui XTTS-v2 has well-known faithfulness knobs none of which were exposed before — defaults bias toward variety + length stability over speaker fidelity.
+
+**Tuned**:
+
+- **`scripts/voice_synth.py`** — inference now passes `temperature=0.65`, `length_penalty=1.0`, `repetition_penalty=10.0`, `top_k=50`, `top_p=0.85`, `enable_text_splitting=True`. Each is overridable via `AGENT_TTS_*` env var so A/B work is one shell-export away
+- **`scripts/voice_clone.py`** — `get_conditioning_latents` called with `max_ref_length=60` (was 30 default), `gpt_cond_len=30` (was 6), `sound_norm_refs=True`. Longer + normalised reference window means the GPT conditioning sees varied prosody, not just the first phrase
+- VERSION 1.10.6
+
+**Validated end-to-end**: re-cloned `bogdo` from the same 35 s mic capture, played via `agent-tts --voice bogdo "…"` → daemon log `cloned id=130 slug=bogdo synth=162506ms play=4924ms samples=106752`. Cold synth still dominated by torch + XTTS model load (~150 s); warm synth keeps prior envelope.
+
+**Honest scope**:
+- **Re-cloning required after tuning** — the new latents are different from v1.10.5's. Existing voices stay at the old conditioning until you re-run `voice clone`
+- **MPS / GPU still not wired** — `AGENT_TTS_DEVICE=mps` works on the synth path but speeds up only the autoregressive decoder; voice load still hits CPU first
+
+---
+
+## v1.10.5 — Daemon resolves voice_synth.py via absolute path · 2026-06-03
+
+**Why a patch:** v1.4 spawned the Python sidecar with a cwd-relative `scripts/voice_synth.py`. The daemon's cwd under launchd is `~`, so the spawn always failed silently for cloned voices and the worker fell back to piper Faber — the user heard the wrong voice and reported "nada parecido". v1.10.5 closes that gap.
+
+**Fixed**:
+
+- **`src/daemon.zig::resolveSidecarPaths`** — probes `$AGENT_TTS_REPO_ROOT` → `/opt/homebrew/share/agent-tts` → `/usr/local/share/agent-tts`, picking the first one where `scripts/voice_synth.py` exists. The matching `.venv-voice/bin/python` is paired so the daemon spawns the pinned interpreter directly (no `uv run` / `python3` fallback when the venv is on disk)
+- **`src/voice.zig::resolveScriptPath` + `venvPythonExists`** — same probe applied to the CLI side so `agent-tts voice clone` works from any cwd, not just the repo root
+- **Install convention** — symlink the repo's `scripts/` + `.venv-voice/` into `/opt/homebrew/share/agent-tts/` so daemons started by launchd find them without an env tweak
+
+**Validated end-to-end**: `agent-tts --voice bogdo "..."` → daemon log `[worker] cloned id=112 slug=bogdo synth=98995ms play=3294ms samples=72192` (cold sidecar). The previous run played piper Faber because the spawn failed.
+
+---
+
+## v1.10.4 — Clone diagnostic + Show WAV in Finder · 2026-06-03
+
+**Why a patch:** user hit v1.10.3 clone failure with cryptic `error: unknown flag '—quiet'` rendered with an em-dash by the terminal font. Root cause was the installed binary lagging behind (v1.10.2 didn't know `--quiet`). The diagnostic surface didn't help the user tell "recorder broke" from "sidecar broke".
+
+**Fixed**:
+
+- **`CloneVoiceWindow`** — logs the staged WAV path + byte count before the subprocess spawn (`Staged WAV: /Users/.../voices/.tmp-<slug>.wav (1563906 bytes)`). 0 bytes ⇒ recorder broke; non-zero ⇒ sidecar broke
+- **New "Show WAV in Finder" button** — appears whenever `stagedURLForDebug` is set so the user can `afplay` the recording without leaving the window
+- VERSION 1.10.4 (binary + bundle)
+
+---
+
 ## v1.10.3 — Guided voice clone UI · 2026-06-03
 
 **Why**: v1.4 shipped `voice clone --sample X.wav --name Y` as a CLI affordance — Gabriel could only clone a voice if he already had a 20-120 s WAV lying around. v1.10.3 closes the loop: the menubar app gains a "Clone my voice…" button that opens a guided window with a Pt-BR reading script, a one-tap recorder, a live VU meter, and a Save & Clone button that hands the freshly captured WAV to `agent-tts voice clone --quiet` and shows the sidecar's progress live. Zero terminal required.

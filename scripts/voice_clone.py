@@ -114,8 +114,16 @@ def main() -> int:
     inner = model.tts_model
 
     print(f"[voice_clone] extracting speaker latents from {sample.name}", file=sys.stderr)
+    # v1.10.6 tuning: extract from a longer reference window + chunk it so the
+    # GPT conditioning sees varied prosody. Defaults of `get_conditioning_latents`
+    # cap max_ref_length at 30s + gpt_cond_len at 6s — leaves long, expressive
+    # samples mostly unused. Larger windows = closer voice match.
     gpt_cond_latent, speaker_embedding = inner.get_conditioning_latents(
         audio_path=str(sample),
+        max_ref_length=int(os.environ.get("AGENT_TTS_MAX_REF_LENGTH", "60")),
+        gpt_cond_len=int(os.environ.get("AGENT_TTS_GPT_COND_LEN", "30")),
+        gpt_cond_chunk_len=int(os.environ.get("AGENT_TTS_GPT_COND_CHUNK_LEN", "6")),
+        sound_norm_refs=True,
     )
 
     np.savez(
