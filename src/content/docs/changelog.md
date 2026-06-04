@@ -9,6 +9,31 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10.1 — Patch (playground fix + menubar icon + live screenshot) · 2026-06-03
+
+**Why a patch:** the v1.9 playground page deployed to GitHub Pages was non-interactive — `<script is:inline>` + `<style>` inside an MDX template literal got stripped/mangled in production. Spotted live by the user after merge. v1.10 had landed without re-validating v1.9's deploy. New rule (saved to `feedback-ship-only-tested.md` in `_memory/`): "shipped" requires end-to-end live-URL validation, not just `npm run build` green.
+
+**Fixes**:
+
+- **`public/playground/widget.js` + `widget.css` (NEW)** — externalized the inline script + style from `src/content/docs/playground.mdx`. Reference via Starlight's `head` frontmatter (`<link rel="stylesheet">` + `<script defer>`). Reliably ships on GitHub Pages
+- **`src/content/docs/playground.mdx`** — rewritten to load external assets, drop inline JS/CSS. Voice picker + Speak button now interactive on live URL
+- **`scripts/build-menubar.sh`** — bakes `AppIcon.icns` from `public/logos/agent-tts-logo.png` via `sips` + `iconutil`. Bundle now ships with the agent-tts robot logo at 16×16 → 512×512@2x. `CFBundleIconFile = AppIcon` added to Info.plist. Bumped bundle version to 1.10.1
+- **`src/content/docs/menubar.md`** — placeholder image swapped for a real screenshot at `public/screenshots/menubar-v1.10.1.png`, captured from the running `/Applications/AgentTTSMenubar.app`
+- **`build.zig.zon` + `src/main.zig`** — `VERSION = "1.10.1"`
+
+**Verification**:
+
+- `npm run build` clean
+- Menubar `.app` installed to `/Applications/AgentTTSMenubar.app` and running (PID confirmed)
+- Live URL https://biliboss.github.io/agent-tts/playground/ will re-validate on next Pages deploy (CI run linked from commit)
+
+**Honest scope still deferred**:
+- v1.10.2 = CoreAudio ducking + signed brew cask + Linux GTK4
+- v1.10.2 = real WASM Piper synth wired into playground (the 501 stub stays in v1.10.1)
+- Popover screenshot (queue + voice picker open) lands with v1.10.2
+
+---
+
 ## v1.6 → v1.10 fan-out summary · 2026-06-03
 
 Parent dispatch fanned out **5 parallel sub-agents** in git worktrees off `main` (`16696e6`), each shipped to its own branch (`agent-tts/v1.X`), gated on `zig build` + `zig build test`, merged serially into `main`.

@@ -1,0 +1,52 @@
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+/* agent-tts v1.10.1 — playground widget styles. Externalized from MDX
+   because Starlight's MDX pipeline does not reliably ship inline
+   <style>/<script> on production builds. */
+.agent-tts-playground {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.5rem;
+  background: var(--sl-color-bg-sidebar);
+}
+.agent-tts-playground label {
+  display: grid;
+  gap: 0.25rem;
+  font-weight: 600;
+}
+.agent-tts-playground select,
+.agent-tts-playground textarea {
+  width: 100%;
+  padding: 0.5rem;
+  font: inherit;
+  background: var(--sl-color-bg);
+  color: var(--sl-color-text);
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.25rem;
+}
+.agent-tts-playground button {
+  justify-self: start;
+  padding: 0.5rem 1rem;
+  font-weight: 700;
+  background: var(--sl-color-accent);
+  color: var(--sl-color-bg);
+  border: 0;
+  border-radius: 0.25rem;
+  cursor: pointer;
+}
+.agent-tts-playground button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.agent-tts-playground [data-role="status"] {
+  font-family: var(--sl-font-mono);
+  font-size: 0.9rem;
+  margin: 0;
+}
+.agent-tts-playground[data-state="pending"] [data-role="status"] {
+  color: var(--sl-color-accent);
+}
+.agent-tts-playground[data-state="error"] [data-role="status"] {
+  color: var(--sl-color-red);
+}

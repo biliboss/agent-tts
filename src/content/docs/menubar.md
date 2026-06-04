@@ -28,7 +28,9 @@ open ui/menubar/build/AgentTTSMenubar.app
 
 Then drag it into `Login Items` (System Settings → General → Login Items) so it starts on login alongside the daemon.
 
-> ![Menubar screenshot placeholder — captured in v1.10.1 after first signed build](https://placehold.co/640x420/png?text=AgentTTSMenubar+screenshot+%E2%80%94+v1.10.1)
+![AgentTTSMenubar status item — captured live from /Applications/AgentTTSMenubar.app on macOS 26.5](/agent-tts/screenshots/menubar-v1.10.1.png)
+
+> v1.10.1 captures only the menubar strip. The popover screenshot (queue + voice picker open) lands in v1.10.2 alongside CoreAudio ducking + the signed brew cask.
 
 ## What's in the popover
 

@@ -11,8 +11,9 @@
 #
 # Output: ui/menubar/build/AgentTTSMenubar.app
 #
-# Codesigning + notarization are out of scope for v1.10 — Gatekeeper will
-# treat the unsigned bundle as "from unidentified developer" until v1.10.1.
+# v1.10.1: bundles AppIcon.icns generated from public/logos/agent-tts-logo.png.
+# Codesigning + notarization are still out of scope — Gatekeeper treats the
+# unsigned bundle as "from unidentified developer". v1.10.2 wires brew cask.
 
 set -euo pipefail
 
@@ -45,6 +46,27 @@ mkdir -p "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 
+# v1.10.1: bake AppIcon.icns from the marketing logo (1024 RGBA → sips →
+# iconutil). Requires `sips` + `iconutil` (macOS native).
+LOGO="$REPO_ROOT/public/logos/agent-tts-logo.png"
+if [ -f "$LOGO" ]; then
+  echo "==> building AppIcon.icns from $LOGO"
+  ICONSET=$(mktemp -d)/agent-tts.iconset
+  mkdir -p "$ICONSET"
+  for sz in 16 32 64 128 256 512; do
+    sips -z $sz $sz "$LOGO" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null 2>&1
+  done
+  cp "$ICONSET/icon_32x32.png"   "$ICONSET/icon_16x16@2x.png"
+  cp "$ICONSET/icon_64x64.png"   "$ICONSET/icon_32x32@2x.png"
+  cp "$ICONSET/icon_256x256.png" "$ICONSET/icon_128x128@2x.png"
+  cp "$ICONSET/icon_512x512.png" "$ICONSET/icon_256x256@2x.png"
+  cp "$ICONSET/icon_512x512.png" "$ICONSET/icon_512x512@2x.png"
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null
+  rm -rf "$ICONSET"
+else
+  echo "warn: $LOGO not found — bundle will use generic icon" >&2
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -54,9 +76,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>io.github.biliboss.agent-tts.menubar</string>
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>agent-tts</string>
-  <key>CFBundleVersion</key><string>1.10.0</string>
-  <key>CFBundleShortVersionString</key><string>1.10.0</string>
+  <key>CFBundleVersion</key><string>1.10.1</string>
+  <key>CFBundleShortVersionString</key><string>1.10.1</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
