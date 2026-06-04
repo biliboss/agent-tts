@@ -1,15 +1,15 @@
 ---
 title: Roadmap
-description: v0.1 → v1.5 shipped 2026-06-03 in a single session. Roadmap complete.
+description: v0.1 → v1.10.13 shipped 2026-06-03 / 04. Roadmap complete; next slate unscheduled.
 ---
 
 ## TL;DR
 
-v0.1 → v1.5 shipped on **2026-06-03**, in one session, behind one KPI. Thirteen milestones, each with a published measurement. Universal binary, brew tap, launchd + systemd auto-start, multilingual code-switch, sentence streaming, Linux/Windows code paths, voice cloning scaffold, and stdio JSON-RPC MCP server — all landed the same day.
+v0.1 → v1.10.13 shipped on **2026-06-03 / 04**, behind one KPI. Eighteen base milestones plus thirteen v1.10.x patches — every row measured. Universal binary, brew tap, launchd + systemd auto-start, multilingual code-switch, sentence streaming, Linux/Windows code paths, voice cloning end-to-end, stdio JSON-RPC MCP server, menubar app with floating player, tech-report mode, audio post-fx, and structured logging — all landed.
 
-The next slate (v1.6+) is unscheduled; see [What's next](/agent-tts/whats-next/).
+The next slate (v1.11+) is unscheduled; see [What's next](/agent-tts/whats-next/).
 
-## v0.1 → v1.5 — Shipped
+## v0.1 → v1.10.13 — Shipped
 
 Every milestone has a published baseline in [`_qa/`](https://github.com/biliboss/agent-tts/tree/main/_qa) and a section in the [Changelog](/agent-tts/changelog/).
 
@@ -60,8 +60,12 @@ Every milestone was measured against **time-to-first-audio (TTFA)**.
 | Cold daemon boot | < 800 ms | pre-warm 280 ms + zaudio 79 ms + piper 373 ms = ~720 ms ✅ |
 | Multi-piper boot (Pt only) | < 800 ms | pre-warm 255 ms + zaudio 54 ms + multi-piper 313 ms = ~622 ms ✅ |
 | Lang detect per message | < 100 µs | informational, not captured this session |
+| Post-fx per chunk (v1.10.10, `--postfx tech`) | < 100 ms warm | cold ~150 ms (ffmpeg spawn + RNNoise load), warm chunks ~53–70 ms ✅ |
+| Post-fx watchdog kill (v1.10.13, `AGENT_TTS_POSTFX_TIMEOUT_MS=2000`) | hard-stop at deadline | killed hung ffmpeg at exactly 2000 ms; dry PCM played ✅ |
+| Concurrent enqueue drain (v1.10.13) | no stall | 5 items with `--postfx tech` drained sequentially, ~6 s each ✅ |
+| Structured-log file write overhead (v1.10.13) | informational | sub-ms per line, rotates at 10 MiB × 3 backups |
 
-Baselines: [`_qa/v0.1` … `_qa/v1.3`](https://github.com/biliboss/agent-tts/tree/main/_qa). Real audio-device dtruss not captured (SIP-on host); documented honestly in `_qa/v1.0-baseline.md`. v1.1+v1.2+v1.3 measurements live inline in the [Changelog](/agent-tts/changelog/).
+Baselines: [`_qa/v0.1` … `_qa/v1.10.13`](https://github.com/biliboss/agent-tts/tree/main/_qa). Real audio-device dtruss not captured (SIP-on host); documented honestly in `_qa/v1.0-baseline.md`. v1.1 → v1.10.13 measurements live inline in the [Changelog](/agent-tts/changelog/).
 
 ## Installation
 
@@ -113,7 +117,7 @@ Auto-start unit paths:
 
 ## What's next
 
-The whole v1.1 → v1.5 marketing slate shipped 2026-06-03. The next slate is unscheduled — see [What's next](/agent-tts/whats-next/) for the policy and how to push priority.
+The whole v0.1 → v1.10.13 slate shipped 2026-06-03 / 04. The next slate (v1.11+) is unscheduled — see [What's next](/agent-tts/whats-next/) for the policy and how to push priority.
 
 ## Locked nots
 

@@ -5,7 +5,7 @@ template: splash
 hero:
   image:
     file: ../../../public/logos/agent-tts-logo.png
-  tagline: "Native voice channel for your AI agents. Zig single binary — Claude Code, Cursor, Cline talk through it. Neural Pt-BR by default. Clone your own voice. Offline, ~90 ms warm synth, $0 per message."
+  tagline: "Native voice channel for your AI agents (v1.10.13). Zig single binary — Claude Code, Cursor, Cline talk through it. Neural Pt-BR by default. Tech-report mode + audio post-fx + structured logging. Clone your own voice. Offline, ~91 ms warm synth, $0 per message."
   actions:
     - text: Install
       link: https://github.com/biliboss/agent-tts#install
@@ -34,9 +34,10 @@ agent-tts --voice gabriel "Deploy concluído."   # cloned voice
 agent-tts history --limit 10                    # persistent timeline
 agent-tts pause; agent-tts resume; agent-tts replay 42
 
-# MCP (Claude Code, Cursor, Cline)
+# MCP (Claude Code, Cursor, Cline) — 13 tools
 claude mcp add agent-tts /opt/homebrew/bin/agent-tts mcp
-# Tools: say / queue / skip / clear / voices / say_stream / pause / resume / replay / history
+# say · queue · skip · clear · voices · say_stream · pause · resume · replay · history
+# synth_voice_test · voice_knob_search · tech_profile_search
 ```
 
 | | agent-tts | macOS `say` | Piper (Python) | ElevenLabs |
@@ -47,10 +48,15 @@ claude mcp add agent-tts /opt/homebrew/bin/agent-tts mcp
 | Persistent queue + history | ✅ SQLite WAL | ❌ | ❌ | ❌ |
 | Pause / resume / replay | ✅ (v1.10.2+) | ❌ | ❌ | ❌ |
 | Voice cloning | ✅ XTTS-v2 sidecar (v1.4+) | ❌ | bring-your-own | ✅ (paid) |
-| SSML prosody | ✅ subset (v1.8+) | ✅ `[[ ]]` only | ❌ | ✅ |
+| SSML prosody | ✅ subset (v1.8+) incl. `<phoneme>` / `<sub>` (v1.10.12) | ✅ `[[ ]]` only | ❌ | ✅ |
+| Per-call Piper knobs | ✅ `length_scale` / `noise_scale` / `noise_w` (v1.10.7) | ❌ | env-only | partial |
+| Tech-report mode | ✅ acronym + unit + brand glossary + CamelCase + URL/hash/version normalizer (v1.10.8 / v1.10.9) | ❌ | ❌ | ❌ |
+| Audio post-fx pipeline | ✅ ffmpeg RNNoise + EQ + de-esser + comp (v1.10.10) | ❌ | ❌ | partial |
+| Cadence pipeline | ✅ list-end drop + bullet lift + breathing splice (v1.10.12) | ❌ | ❌ | partial |
+| Structured logging | ✅ ISO 8601 file sink, rotating, scope/level filters (v1.10.13) | ❌ | ❌ | n/a |
 | Streaming text input | ✅ (v1.7+) | ❌ | manual | ✅ |
-| Menubar app | ✅ SwiftUI (v1.10+) | ❌ | ❌ | ❌ |
-| MCP server bundled | ✅ stdio JSON-RPC | ❌ | ❌ | ❌ |
+| Menubar app | ✅ SwiftUI status item + floating player (v1.10 / v1.10.2) | ❌ | ❌ | ❌ |
+| MCP server bundled | ✅ stdio JSON-RPC, 13 tools | ❌ | ❌ | ❌ |
 | Single binary | ✅ ~1 MB | n/a | ❌ Python venv | ❌ |
 | Offline | ✅ | ✅ | ✅ | ❌ |
 | Cost per message | $0 | $0 | $0 | $$$ |
@@ -71,7 +77,7 @@ Everything is benchmarked against the gap between calling `agent-tts "text"` and
 
 <CardGrid>
   <Card title="MCP server bundled" icon="puzzle">
-    `agent-tts mcp` — stdio JSON-RPC. 10 tools: `say`, `queue`, `skip`, `clear`, `voices`, `say_stream`, `pause`, `resume`, `replay`, `history`. Drop-in for Claude Code / Cursor / Cline. [Read →](/agent-tts/mcp/)
+    `agent-tts mcp` — stdio JSON-RPC. **13 tools**: `say`, `queue`, `skip`, `clear`, `voices`, `say_stream`, `pause`, `resume`, `replay`, `history`, `synth_voice_test`, `voice_knob_search`, `tech_profile_search`. Drop-in for Claude Code / Cursor / Cline. [Read →](/agent-tts/mcp/)
   </Card>
   <Card title="Streaming input" icon="open-book">
     `agent-tts stream` reads stdin and emits sentences as terminators arrive. MCP `say_stream(stream_id, chunk, final?)` matches the LLM delta shape. Hear the agent before it finishes thinking.
@@ -86,7 +92,19 @@ Everything is benchmarked against the gap between calling `agent-tts "text"` and
     macOS NSStatusItem + floating NSPanel. Skip / Replay / voice picker — without opening a terminal. [Read →](/agent-tts/menubar/)
   </Card>
   <Card title="SSML & prosody" icon="document">
-    W3C SSML 1.1 subset: `<emphasis>`, `<break>`, `<prosody>`, `<say-as>`. Parse < 0.2 µs / 280 chars. Works on `say` and on Piper (length-scale + silence). [Read →](/agent-tts/motor/)
+    W3C SSML 1.1 subset: `<emphasis>`, `<break>`, `<prosody>`, `<say-as>`, plus `<phoneme alphabet="ipa">` and `<sub alias="…">` (v1.10.12) for brand-name IPA and code-identifier substitution. Parse < 0.2 µs / 280 chars. [Read →](/agent-tts/motor/)
+  </Card>
+  <Card title="Tech-report mode" icon="setting">
+    `--profile tech` ships research-anchored Faber knobs (`length=1.05` / `noise=0.35` / `noise_w=0.45`) plus an ~80-entry acronym + unit + brand glossary, a CamelCase splitter and a version/commit-hash/URL/path/hex normalizer. `tech_profile_search` MCP tool A/Bs four bundles in one round-trip (v1.10.8 / v1.10.9).
+  </Card>
+  <Card title="Audio post-fx pipeline" icon="approve-check-circle">
+    `--postfx clean|tech|broadcast` spawns ffmpeg with RNNoise + 4-band EQ + de-esser + 2:1 compressor between piper and zaudio. Per-chunk; falls back to dry PCM if ffmpeg or the RNNoise model is missing. `postfx_ms` logged per chunk (v1.10.10).
+  </Card>
+  <Card title="Per-call Piper knobs" icon="pencil">
+    `--length-scale` / `--noise-scale` / `--noise-w` flags + matching MCP `say` params. No daemon restart for A/B. `synth_voice_test` and `voice_knob_search` MCP tools batch up to 16 variants in one call (v1.10.7 / v1.10.8).
+  </Card>
+  <Card title="Structured logging" icon="document">
+    `~/.cache/agent-tts/daemon.log` with ISO 8601 lines, rotating at 10 MiB × 3 backups. `AGENT_TTS_LOG_LEVEL` / `_SCOPES` / `_PATH` / `_MAX_BYTES` filter without rebuild. Worker watchdog kills hung ffmpeg, `defer finishPlaying` keeps the queue advancing (v1.10.13).
   </Card>
 </CardGrid>
 
@@ -104,6 +122,6 @@ Dual **MIT OR Apache-2.0** for the agent-tts source. **GPL-3.0-or-later** inheri
 
 ## Stay in sync
 
-Living project. Eighteen base + six patch milestones already shipped — see the [Roadmap](/agent-tts/roadmap/) and [Changelog](/agent-tts/changelog/) for the full timeline. The current state of every feature lives in [Architecture](/agent-tts/arquitetura/), [TTS engine](/agent-tts/motor/), [MCP server](/agent-tts/mcp/), [Menubar UI](/agent-tts/menubar/), and [Playground](/agent-tts/playground/).
+Living project. Eighteen base + thirteen patch milestones already shipped (current head **v1.10.13**) — see the [Roadmap](/agent-tts/roadmap/) and [Changelog](/agent-tts/changelog/) for the full timeline. The current state of every feature lives in [Architecture](/agent-tts/arquitetura/), [TTS engine](/agent-tts/motor/), [MCP server](/agent-tts/mcp/), [Menubar UI](/agent-tts/menubar/), and [Playground](/agent-tts/playground/).
 
 > PRs welcome at [biliboss/agent-tts](https://github.com/biliboss/agent-tts). Vote with stars + issues tagged `roadmap` to push priority.

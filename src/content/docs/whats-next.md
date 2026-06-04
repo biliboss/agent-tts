@@ -1,11 +1,11 @@
 ---
 title: What's next
-description: v1.1 → v1.10.8 all shipped 2026-06-03/04. Next milestones land here when planned.
+description: v1.1 → v1.10.13 all shipped 2026-06-03 / 04. Next milestones land here when planned.
 ---
 
 ## TL;DR
 
-**The entire v1.6 → v1.10.8 slate shipped on 2026-06-03 / 04**, plus v1.1 → v1.5 earlier the same day. Eighteen base + eight patch milestones, all measured.
+**The entire v1.6 → v1.10.13 slate shipped on 2026-06-03 / 04**, plus v1.1 → v1.5 earlier the same day. Eighteen base + thirteen patch milestones (31 total), all measured. Current head: **v1.10.13**.
 
 - **v1.6 Voice cloning ship-it** — XTTS-v2 sidecar live; first cloned voice; 5 install blockers fixed
 - **v1.7 Streaming text input** — `agent-tts stream` + `say_stream` MCP tool + incremental chunker
