@@ -71,10 +71,19 @@ public final class QueueModel: ObservableObject {
 public struct QueueView: View {
     @ObservedObject var model: QueueModel
     @ObservedObject var voiceModel: VoicePickerModel
+    // v1.10.3 — AppDelegate-injected callback to open the guided Clone window.
+    // Held as an optional so the view stays usable in previews/tests that
+    // don't care about the clone flow.
+    var onCloneRequested: (() -> Void)?
 
-    public init(model: QueueModel, voiceModel: VoicePickerModel) {
+    public init(
+        model: QueueModel,
+        voiceModel: VoicePickerModel,
+        onCloneRequested: (() -> Void)? = nil
+    ) {
         self.model = model
         self.voiceModel = voiceModel
+        self.onCloneRequested = onCloneRequested
     }
 
     public var body: some View {
@@ -83,11 +92,28 @@ public struct QueueView: View {
             Divider()
             VoicePicker(model: voiceModel)
             Divider()
+            // v1.10.3 — one-button entrance to the guided clone window.
+            cloneRow
+            Divider()
             content
             Divider()
             footer
         }
-        .frame(width: 320, height: 420)
+        .frame(width: 320, height: 460)
+    }
+
+    private var cloneRow: some View {
+        HStack {
+            Button(action: { onCloneRequested?() }) {
+                Label("Clone my voice…", systemImage: "waveform.badge.mic")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.borderless)
+            .disabled(onCloneRequested == nil)
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
     }
 
     // MARK: header

@@ -21,10 +21,12 @@ pub const HELP =
     \\agent-tts voice — manage cloned voices (v1.4+)
     \\
     \\Usage:
-    \\  agent-tts voice clone --sample <wav> --name <slug>
+    \\  agent-tts voice clone --sample <wav> --name <slug> [--quiet]
     \\      Clone a voice from a 20-120s WAV. Slug must be [a-z0-9-]+, 1-32 chars.
     \\      Writes ~/.cache/agent-tts/voices/<slug>/{embedding.npz,metadata.json}.
     \\      Requires the Python sidecar — run scripts/setup-voice-clone.sh once.
+    \\      --quiet suppresses the progress chatter and prints only `OK\t<slug>`
+    \\      on success — designed for non-tty parents (v1.10.3 menubar app).
     \\
     \\  agent-tts voice list
     \\      List installed voices (faber + every cloned voice on disk).
@@ -83,6 +85,10 @@ pub fn cmdClone(
 ) !void {
     var sample_path: ?[]const u8 = null;
     var name: ?[]const u8 = null;
+    // v1.10.3 — `--quiet` suppresses the progress chatter so a non-tty parent
+    // (the menubar Clone window) can parse a single `OK\t<slug>` line at the
+    // tail. Error paths still print to stderr.
+    var quiet: bool = false;
 
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
@@ -101,6 +107,8 @@ pub fn cmdClone(
                 std.process.exit(2);
             }
             name = args[i];
+        } else if (std.mem.eql(u8, a, "--quiet")) {
+            quiet = true;
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             std.debug.print("{s}", .{HELP});
             return;
@@ -161,31 +169,44 @@ pub fn cmdClone(
     const embedding_path = try std.fmt.allocPrint(arena, "{s}/embedding.npz", .{voice_dir});
     const metadata_path = try std.fmt.allocPrint(arena, "{s}/metadata.json", .{voice_dir});
 
-    std.debug.print(
-        "[voice clone] slug={s} sample={s} duration={d:.1}s rate={d}Hz\n",
-        .{ name.?, sample_path.?, duration_s, info.sample_rate },
-    );
+    if (!quiet) {
+        std.debug.print(
+            "[voice clone] slug={s} sample={s} duration={d:.1}s rate={d}Hz\n",
+            .{ name.?, sample_path.?, duration_s, info.sample_rate },
+        );
+    }
 
     // Sidecar invocation. We do NOT mandate `uv` — try it first because the
     // setup script uses it, fall back to plain `python3` if uv isn't on PATH.
-    // The script handles its own dependency resolution.
+    // The script handles its own dependency resolution. In --quiet mode the
+    // sidecar's stdout is sunk to /dev/null but stderr stays attached so the
+    // parent UI can still surface real errors.
     try invokeSidecar(arena, io, home, &.{
         "scripts/voice_clone.py",
         "--sample",
         sample_path.?,
         "--out",
         embedding_path,
-    });
+    }, quiet);
 
     // Metadata is written by Zig (not the Python sidecar) — that way a partial
     // sidecar success still leaves us with a structured record + we don't have
     // to round-trip a clock through Python.
     try writeMetadata(io, metadata_path, name.?, sample_path.?, info, duration_s);
 
-    std.debug.print(
-        "[voice clone] OK — embedded at {s}\n[voice clone] use: agent-tts --voice {s} \"Olá\"\n",
-        .{ embedding_path, name.? },
-    );
+    if (quiet) {
+        // Single machine-parseable success line — the menubar app reads this.
+        const out = std.Io.File.stdout();
+        var buf: [128]u8 = undefined;
+        var w = out.writerStreaming(io, &buf);
+        try w.interface.print("OK\t{s}\n", .{name.?});
+        try w.interface.flush();
+    } else {
+        std.debug.print(
+            "[voice clone] OK — embedded at {s}\n[voice clone] use: agent-tts --voice {s} \"Olá\"\n",
+            .{ embedding_path, name.? },
+        );
+    }
 }
 
 /// `agent-tts voice list` — print faber + each cloned voice with a one-line
@@ -438,6 +459,7 @@ fn invokeSidecar(
     io: std.Io,
     home: []const u8,
     script_args: []const []const u8,
+    quiet: bool,
 ) !void {
     _ = home;
     // Resolve script path relative to cwd. Caller is responsible for cwd ==
@@ -445,10 +467,15 @@ fn invokeSidecar(
     // resolve relative to the binary's location.
     const argv = try buildArgv(arena, script_args);
 
+    // v1.10.3 — when called from the menubar UI we want exactly one
+    // `OK\t<slug>` line on stdout. The sidecar prints its own banner
+    // ("[ok] embedding written…") which would corrupt that contract.
+    // Route sidecar stdout to /dev/null in quiet mode; keep stderr attached
+    // so genuine failures still surface in the menubar log textbox.
     var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
-        .stdout = .inherit,
+        .stdout = if (quiet) .ignore else .inherit,
         .stderr = .inherit,
     }) catch |e| {
         std.debug.print(
@@ -600,6 +627,13 @@ test "HELP text mentions clone + list" {
     try std.testing.expect(std.mem.indexOf(u8, HELP, "voice list") != null);
     try std.testing.expect(std.mem.indexOf(u8, HELP, "--sample") != null);
     try std.testing.expect(std.mem.indexOf(u8, HELP, "--name") != null);
+}
+
+test "HELP advertises --quiet (v1.10.3)" {
+    // Menubar app shells out and parses `OK\t<slug>` — the flag is part of
+    // the contract, so the help text must surface it.
+    try std.testing.expect(std.mem.indexOf(u8, HELP, "--quiet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, HELP, "OK\\t<slug>") != null);
 }
 
 test "parseVoiceMetadata extracts duration + rate" {

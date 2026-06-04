@@ -9,6 +9,51 @@ Per milestone: what shipped, how we measured, what slipped to the next one. The 
 
 ---
 
+## v1.10.3 — Guided voice clone UI · 2026-06-03
+
+**Why**: v1.4 shipped `voice clone --sample X.wav --name Y` as a CLI affordance — Gabriel could only clone a voice if he already had a 20-120 s WAV lying around. v1.10.3 closes the loop: the menubar app gains a "Clone my voice…" button that opens a guided window with a Pt-BR reading script, a one-tap recorder, a live VU meter, and a Save & Clone button that hands the freshly captured WAV to `agent-tts voice clone --quiet` and shows the sidecar's progress live. Zero terminal required.
+
+**Shipped — menubar (Swift)**:
+
+- `ui/menubar/Sources/AgentTTSMenubar/CloneVoiceWindow.swift` (NEW, ~440 LOC) — 520 × 640 `NSWindow` with a SwiftUI root. Slug input mirrors `voice.zig::validateSlug` (`[a-z0-9-]{1,32}`) and surfaces an inline regex hint when invalid. The reading script is hard-coded as five Pt-BR sentences (declarative + interrogative + exclamative + list + numbers + emotion) so XTTS sees broad prosody signal in a 30-90 s window; an auto-advance timer highlights the current sentence every 7 s. Big red Record button toggles to Stop. Status row covers idle / requestingPermission / permissionDenied / recording / finishedRecording / processing / done / failed. Live processing log textbox streams the `agent-tts voice clone` subprocess's stdout+stderr so the user sees XTTS progress (currently noisy by design). Save & Clone spawns `agent-tts voice clone --sample ~/.cache/agent-tts/voices/.tmp-<slug>.wav --name <slug> --quiet`; on exit code 0 the button changes to **Done** and the catalogue reloads.
+- `ui/menubar/Sources/AgentTTSMenubar/VoiceRecorder.swift` (NEW, ~170 LOC) — `AVAudioRecorder` wrapper configured for 22 050 Hz mono 16-bit s16le PCM (matches Faber + what `voice.zig::sniffWav` validates). Microphone permission handled via `AVCaptureDevice.requestAccess(for: .audio)` with `notDetermined → prompt`, `denied/restricted → actionable error`, `authorized → record`. `peakLevel()` polls `averagePower(forChannel:0)` and maps –50 … 0 dB → 0 … 1 for the VU meter. `cancel()` deletes the partial file so failed sessions don't leave WAV droppings around.
+- `ui/menubar/Sources/AgentTTSMenubar/AppDelegate.swift` — `openCloneWindow()` action wired to a new popover row. Strong-references a `CloneVoiceWindowController` so the SwiftUI scene survives transient dismissal. Reload-on-close refreshes `VoicePickerModel` so the new slug appears immediately in the picker. Hidden `AGENT_TTS_AUTOSHOW_CLONE=1` env triggers auto-open at launch — used for live validation, no-op in production.
+- `ui/menubar/Sources/AgentTTSMenubar/QueueView.swift` — popover gains a "Clone my voice…" row above the queue list. Popover height bumped 420 → 460 to accommodate it. Row is driven by an injectable closure so previews/tests don't depend on the AppDelegate.
+
+**Shipped — daemon (Zig)**:
+
+- `src/voice.zig` — `cmdClone` accepts `--quiet`. When set: suppresses the `[voice clone] …` progress prints, redirects the Python sidecar's stdout to `/dev/null`, and prints exactly one machine-parseable line `OK\t<slug>\n` on success (stderr stays attached so genuine errors still surface to the parent UI's log textbox). `invokeSidecar` grew a `quiet: bool` parameter that flips `stdout = .ignore`. Two new tests cover the HELP text contract.
+- `src/main.zig` — `VERSION = "1.10.3"`.
+- `build.zig.zon` — `.version = "1.10.3"`.
+
+**Shipped — bundle**:
+
+- `scripts/build-menubar.sh` — `CFBundleVersion` + `CFBundleShortVersionString` bumped to 1.10.3. **New `NSMicrophoneUsageDescription`** key is mandatory for the AVCaptureDevice prompt: macOS terminates apps that try to record without it. The string surfaces verbatim in the macOS permission dialog.
+
+**Live test (2026-06-03, mac mini M-series, macOS 26.5)**:
+
+1. `zig build -Doptimize=ReleaseFast -Dwith-piper=true` — green, 0 warnings (post-baseline cache hit).
+2. `zig build test` — green; 12 voice.zig tests pass (10 baseline + 2 new for `--quiet` HELP contract).
+3. `swift build -c release` — green, 7.5 s clean build, 0 warnings.
+4. `bash scripts/build-menubar.sh` — produces `ui/menubar/build/AgentTTSMenubar.app`, plist verified via `plutil -p` (NSMicrophoneUsageDescription present).
+5. App installed to `/Applications/AgentTTSMenubar.app`, launched via `AGENT_TTS_AUTOSHOW_CLONE=1 open`.
+6. **Clone window opened** — screenshot at `_qa/v1.10.3-clone-window.png` shows slug field, [a-z0-9-]{1,32} regex hint, full Pt-BR script with first sentence highlighted via accent-color background, Record button, VU meter strip, status row, Cancel + Save & Clone buttons.
+7. **Microphone permission prompt granted** (first run; cached for subsequent launches).
+8. Typed slug `gabriel`, clicked Record, ~40 s of mic capture observed (VU meter active, 00:40 elapsed). Stopped recording → produced `/var/folders/.../T/agent-tts-clone-<UUID>.wav` 1.8 MB, staged to `~/.cache/agent-tts/voices/.tmp-gabriel.wav`.
+9. Save & Clone subprocess spawned (`agent-tts voice clone --quiet`); the popover-level catalog reload landed cleanly.
+10. **Independent `--quiet` contract validation**: invoked `agent-tts voice clone --sample <wav> --name unit-test-quiet --quiet` against the staged WAV with a stub sidecar — produced exactly `OK\tunit-test-quiet\n` (single line, no progress chatter, exit 0). Verbose mode regression check still emits the full `[voice clone] …` banners.
+11. WAV metadata after clone: `duration_seconds: 40.44`, `sample_rate: 22050`, `channels: 1` — exactly the recorder's 22 050 Hz mono s16le contract.
+
+**Honest scope**:
+
+- **XTTS sidecar end-to-end** — this session ran without `.venv-voice` provisioned, so the live test exercised the clone window's spawn path with a stub sidecar (validated `--quiet` round-trip + exit-code routing + log streaming) rather than producing a real cloned voice. Users with `scripts/setup-voice-clone.sh` already run will get the real XTTS-v2 embedding on the same code path; nothing in the v1.10.3 changeset alters the sidecar contract.
+- **Microphone permission denied path** — surfaced via `VoiceRecorderError.permissionDenied` + the `.permissionDenied` phase, which prints the actionable "open System Settings → Privacy & Security → Microphone" string in the status row. Tested manually by toggling the permission off in System Settings (covered by an inline error path, not a screenshot).
+- **AGENT_TTS_AUTOSHOW_CLONE env hook** — present so the live-validation flow can auto-open the window without driving the popover via AppleScript. Production launches without the env var behave identically to v1.10.2 until the user clicks the new popover row.
+
+**Lead time**: see `_qa/v1.10.3-leadtime.md`.
+
+---
+
 ## v1.10.2 — History + pause/resume + floating player · 2026-06-03
 
 **Why**: v1.10 shipped a one-shot enqueue UI — once an item left the queue, it was gone. No way to pause mid-utterance, no way to replay a past message, no always-on-top widget surfacing what's currently playing. v1.10.2 turns agent-tts into a proper voice player: persistent history, mid-playback pause/resume, replay any past item by id, and a floating overlay panel on macOS that shows the active item plus controls. Same four ops surface through CLI, MCP, and the menubar overlay.

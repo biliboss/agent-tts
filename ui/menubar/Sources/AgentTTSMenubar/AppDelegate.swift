@@ -29,6 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // QueueModel (which polls only while the popover is open).
     private let floatingClient = SocketClient()
     private var floatingTimer: Timer?
+    // v1.10.3 — guided clone window. Held strong; the controller wipes its
+    // window reference on close so a second openCloneWindow() rebuilds.
+    private var cloneController: CloneVoiceWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hide the dock icon / app menu. We're menubar-only.
@@ -53,8 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 320, height: 420)
-        let content = QueueView(model: queueModel, voiceModel: voiceModel)
+        // v1.10.3 — popover grew 40 px to host the "Clone my voice…" row.
+        popover.contentSize = NSSize(width: 320, height: 460)
+        let content = QueueView(
+            model: queueModel,
+            voiceModel: voiceModel,
+            onCloneRequested: { [weak self] in self?.openCloneWindow() }
+        )
         popover.contentViewController = NSHostingController(rootView: content)
 
         // v1.10.2 — start the floating-player polling loop regardless of
@@ -62,6 +70,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // item appears AND the user has enabled the widget. 750 ms keeps
         // the daemon load similar to the popover's polling cadence.
         startFloatingPolling()
+
+        // v1.10.3 — debug hook for live validation. When the env var is set,
+        // the app auto-opens the Clone window on launch so the operator can
+        // exercise the recorder + spawn flow without driving the popover via
+        // AppleScript. Production launches ignore this entirely.
+        if ProcessInfo.processInfo.environment["AGENT_TTS_AUTOSHOW_CLONE"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.openCloneWindow()
+            }
+        }
     }
 
     @objc private func togglePopover(_ sender: Any?) {
@@ -86,6 +104,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         floatingTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tickFloating() }
         }
+    }
+
+    /// v1.10.3 — open (or front-most) the guided Clone window. Closing the
+    /// popover happens implicitly because we activate the app; the user
+    /// returns to the menubar item to dismiss it.
+    @objc func openCloneWindow() {
+        // Dismiss the popover so we don't leave a transient floating UI
+        // behind the modal-ish clone window.
+        if popover?.isShown == true {
+            popover.performClose(nil)
+            queueModel.stopPolling()
+        }
+        if cloneController == nil {
+            cloneController = CloneVoiceWindowController(onClose: { [weak self] in
+                // Refresh the catalog so the freshly cloned slug appears the
+                // next time the user opens the popover.
+                self?.voiceModel.reload()
+            })
+        }
+        cloneController?.show()
     }
 
     private func tickFloating() {

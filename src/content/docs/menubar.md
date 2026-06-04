@@ -40,6 +40,26 @@ Then drag it into `Login Items` (System Settings → General → Login Items) so
 - **Queue list** — one row per item with a state dot (green = playing, grey = pending), the text preview, the engine + voice + rate, and the daemon's `id`. Polls every 750 ms while the popover is open, 0 polls while it's closed.
 - **Footer** — Skip + Clear buttons (same semantics as `agent-tts skip` / `agent-tts clear`), last-poll round-trip readout in milliseconds, power button to quit.
 
+## Clone your voice (v1.10.3+)
+
+The popover gains a **Clone my voice…** row that opens a guided window for the v1.10.3 one-button voice-clone UX. No CLI, no manual WAV trimming, no `say -o` dance.
+
+The window walks the user through five steps:
+
+1. **Pick a slug** — single-line input validated against `[a-z0-9-]{1,32}` (same regex `src/voice.zig::validateSlug` enforces). Inline red hint when the slug is malformed.
+2. **Read the script** — a hard-coded 30-90 s Pt-BR passage with varied prosody (declarative + interrogative + exclamative + lists + numbers + abbreviations + emotion). One sentence is highlighted at a time; an auto-advance timer moves the cursor forward every ~7 s so the user keeps pace.
+3. **Tap Record** — first launch triggers `AVCaptureDevice.requestAccess(for: .audio)`, persisted by macOS. Denied → an actionable status string points the user at System Settings → Privacy & Security → Microphone.
+4. **Watch the VU meter** — a live `peakLevel()` poll (50 ms tick) drives a green rectangle whose width tracks `averagePower(forChannel:0)`. Recording captures 22 050 Hz mono 16-bit s16le PCM — the exact shape `voice.zig::sniffWav` validates and the XTTS-v2 sidecar consumes natively.
+5. **Save & Clone** — the WAV is staged to `~/.cache/agent-tts/voices/.tmp-<slug>.wav` and `agent-tts voice clone --sample <wav> --name <slug> --quiet` is spawned via `Process`. The subprocess's stdout + stderr stream into a log textbox so the XTTS sidecar's progress is visible. On exit code 0 the button becomes **Done** and the popover's voice picker reloads to surface the new slug.
+
+The `--quiet` flag is a v1.10.3 addition (`src/voice.zig`): it suppresses the `[voice clone] …` progress chatter, redirects the sidecar's stdout to `/dev/null`, and emits exactly one parseable `OK\t<slug>\n` line on success. Errors still go to stderr so they show up in the menubar app's log textbox.
+
+The bundle now ships an `NSMicrophoneUsageDescription` — required by macOS for any app that touches `AVAudioRecorder`. The string surfaces verbatim in the permission prompt.
+
+![Clone window — captured live at the Recording state from /Applications/AgentTTSMenubar.app on macOS 26.5](/agent-tts/screenshots/v1.10.3-clone-window.png)
+
+> Screenshot above is the live `_qa/v1.10.3-clone-window.png` captured at the "Recording…" state on macOS 26.5; the docs publish step will mirror it under `public/` on the next deploy.
+
 ## Floating player (v1.10.2+)
 
 A compact 320×60 `NSPanel` that floats above other windows (`level = .floating`, `.canJoinAllSpaces`) and surfaces the currently playing item plus controls — so you can pause/resume/skip/replay without opening the popover. Lifecycle:

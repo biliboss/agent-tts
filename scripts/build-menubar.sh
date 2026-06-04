@@ -76,13 +76,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>io.github.biliboss.agent-tts.menubar</string>
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>agent-tts</string>
-  <key>CFBundleVersion</key><string>1.10.2</string>
-  <key>CFBundleShortVersionString</key><string>1.10.2</string>
+  <key>CFBundleVersion</key><string>1.10.3</string>
+  <key>CFBundleShortVersionString</key><string>1.10.3</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>agent-tts needs your microphone to record the voice sample used for cloning. Recording only happens when you tap Record in the Clone window.</string>
 </dict>
 </plist>
 PLIST
